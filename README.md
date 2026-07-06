@@ -121,6 +121,12 @@ proxy cmdlets that expose things as `Object[]`), teach the tool by adding a row 
 
 ## Status / roadmap
 
+- **v0.6 (2026-07-06):** parameter-set resolution (no more spurious required params like
+  `-Owner`); `?` explains each optional/switch parameter (action help → glossary → Get-Help,
+  with `-LoadCmdletHelp` on EXO connect); validates values against allowed sets and identity
+  fields against the directory (typos/nonsense are flagged, not accepted); post-action
+  "What next?" menu (do another / switch service / quit); reports `Failed: <msg>` on error;
+  standard white/green/yellow/red colors; SendAs handled via the correct action.
 - **v0.5 (2026-07-06):** remembers UPN + last-used service; "who am I" preflight after
   connect; **Search actions by keyword**; `find` directory lookup for identity fields.
 - **v0.4 (2026-07-06):** three more services wired — **SharePoint Admin (SPO)**,
