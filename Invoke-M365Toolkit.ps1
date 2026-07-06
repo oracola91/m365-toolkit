@@ -225,6 +225,37 @@ $ParamHints = @{
 }
 
 # ---------------------------------------------------------------------------
+# Optional target lookups. For identity-style parameters the user can type
+# 'find' to search the directory and pick from a list instead of typing an
+# address. Each entry: Probe = a cmdlet whose presence means the lookup can run
+# (i.e. you're connected to the right service); Run = { param($term) ... }
+# returning objects with .Display (what to show) and .Value (what to submit).
+# ---------------------------------------------------------------------------
+$recipientLookup = @{
+    Probe = 'Get-EXORecipient'
+    Run   = {
+        param($term)
+        Get-EXORecipient -ResultSize 25 -Filter "DisplayName -like '*$term*' -or PrimarySmtpAddress -like '*$term*'" -ErrorAction Stop |
+            ForEach-Object { [pscustomobject]@{ Display = ('{0}  <{1}>  [{2}]' -f $_.DisplayName, $_.PrimarySmtpAddress, $_.RecipientTypeDetails); Value = [string]$_.PrimarySmtpAddress } }
+    }
+}
+$ParamLookup = @{
+    Identity = $recipientLookup
+    User     = $recipientLookup
+    Trustee  = $recipientLookup
+    Member   = $recipientLookup
+    Mailbox  = $recipientLookup
+    UserId   = @{
+        Probe = 'Get-MgUser'
+        Run   = {
+            param($term)
+            Get-MgUser -Filter "startswith(displayName,'$term') or startswith(mail,'$term') or startswith(userPrincipalName,'$term')" -Top 25 -ErrorAction Stop |
+                ForEach-Object { [pscustomobject]@{ Display = ('{0}  <{1}>' -f $_.DisplayName, $_.UserPrincipalName); Value = [string]$_.UserPrincipalName } }
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Small UI helper: print a numbered menu and return the chosen item (or $null).
 # ---------------------------------------------------------------------------
 function Get-MenuChoice {
@@ -607,8 +638,14 @@ function Read-ParameterValue {
             default                 { $type.Name }
         }
     }
+    # Directory lookup: offer 'find' when a lookup is registered for this param
+    # AND its probe cmdlet is loaded (i.e. we're connected to the right service).
+    $lookup  = $ParamLookup[$name]
+    $canFind = $lookup -and (Get-Command $lookup.Probe -ErrorAction SilentlyContinue)
+
     $label = ('Enter -{0} [{1}]{2}' -f $name, $hint, $(if ($Required) { ' (required)' } else { '' }))
     if ($allowed) { $label += ' - type ? to list options' }
+    if ($canFind) { $label += " - or type 'find' to search" }
 
     while ($true) {
         $val = Read-Host $label
@@ -616,6 +653,18 @@ function Read-ParameterValue {
             if ($allowed) { Write-Host ('  Options: ' + ($allowed -join ', ')) -ForegroundColor Cyan }
             else          { Write-Host '  No fixed list for this one - free text.' -ForegroundColor DarkGray }
             continue
+        }
+        if ($val -eq 'find' -and $canFind) {
+            $term = Read-Host '  Search text (name or email)'
+            if ([string]::IsNullOrWhiteSpace($term)) { continue }
+            try { $hits = @(& $lookup.Run $term) }
+            catch { Write-Host ('  Lookup failed: {0}' -f $_.Exception.Message) -ForegroundColor Yellow; continue }
+            if ($hits.Count -eq 0) { Write-Host '  No matches - try again, or just type the value.' -ForegroundColor Yellow; continue }
+            $pick = Get-MenuChoice -Title '  Pick one:' -Options @($hits.Display) -AllowBack
+            if (-not $pick) { continue }
+            $sel = $hits | Where-Object { $_.Display -eq $pick } | Select-Object -First 1
+            Write-Host ('  -> using {0}' -f $sel.Value) -ForegroundColor DarkGray
+            return $sel.Value
         }
         if ([string]::IsNullOrWhiteSpace($val) -and $Required) {
             Write-Host '  This one is required.' -ForegroundColor Yellow
@@ -696,6 +745,60 @@ function Show-Result {
     }
 }
 
+# ---------------------------------------------------------------------------
+# Tiny persisted config (UPN + last service) at <ToolkitHome>\config.json so
+# you don't retype your email every launch.
+# ---------------------------------------------------------------------------
+function Get-ToolkitConfig {
+    $path = Join-Path $script:ToolkitHome 'config.json'
+    if (Test-Path $path) { try { return (Get-Content $path -Raw | ConvertFrom-Json) } catch { } }
+    [pscustomobject]@{ Upn = $null; LastService = $null }
+}
+function Save-ToolkitConfig {
+    param([string] $Upn, [string] $LastService)
+    if (-not (Test-Path $script:ToolkitHome)) { New-Item -ItemType Directory -Path $script:ToolkitHome -Force | Out-Null }
+    [pscustomobject]@{ Upn = $Upn; LastService = $LastService } |
+        ConvertTo-Json | Set-Content -Path (Join-Path $script:ToolkitHome 'config.json') -Encoding UTF8
+}
+
+# ---------------------------------------------------------------------------
+# "Who am I" preflight: after connecting, show the identity in use (and the
+# granted Graph scopes / EXO org) so you know your blast radius before acting.
+# ---------------------------------------------------------------------------
+function Show-WhoAmI {
+    param([Parameter(Mandatory)] $Service, [string] $Upn)
+    Write-Host ("Connected as: {0}" -f $Upn) -ForegroundColor Green
+    try {
+        if ($Service.Module -eq 'ExchangeOnlineManagement') {
+            $ci = Get-ConnectionInformation -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($ci) { Write-Host ("  Org: {0}  |  UPN: {1}" -f $ci.Organization, $ci.UserPrincipalName) -ForegroundColor DarkGray }
+        } elseif ($Service.Module -like 'Microsoft.Graph*') {
+            $ctx = Get-MgContext -ErrorAction SilentlyContinue
+            if ($ctx) {
+                Write-Host ("  Account: {0}" -f $ctx.Account) -ForegroundColor DarkGray
+                Write-Host ("  Granted scopes: {0}" -f ($ctx.Scopes -join ', ')) -ForegroundColor DarkGray
+            }
+        }
+    } catch { }
+}
+
+# ---------------------------------------------------------------------------
+# Given a catalogued action, ask run-once vs bulk and dispatch. Shared by the
+# category browser and the keyword search.
+# ---------------------------------------------------------------------------
+function Invoke-Action {
+    param([Parameter(Mandatory)] $Action)
+    $mode = Get-MenuChoice -Title "How do you want to run '$($Action.Label)'?" `
+                -Options @('Run once (type the values now)','Bulk - run for every row in a CSV file') -AllowBack
+    if (-not $mode) { return }
+    if ($mode -like 'Bulk*') {
+        Invoke-BulkCmdlet  -Cmdlet $Action.Cmdlet -Prompt $Action.Prompt -ParamHelp $Action.ParamHelp -Preset $Action.Preset
+    } else {
+        Invoke-GuidedCmdlet -Cmdlet $Action.Cmdlet -Prompt $Action.Prompt -Help $Action.Help -ParamHelp $Action.ParamHelp -Preset $Action.Preset
+    }
+    Read-Host 'Press Enter to continue' | Out-Null
+}
+
 # ===========================================================================
 # Main loop
 # ===========================================================================
@@ -707,23 +810,31 @@ function Start-M365Toolkit {
     Start-Transcript -Path $logFile -Append | Out-Null
     try {
         Write-Host '=====================================================' -ForegroundColor Cyan
-        Write-Host '  Microsoft 365 Guided Command Builder  (v0.1)'        -ForegroundColor Cyan
+        Write-Host '  Microsoft 365 Guided Command Builder  (v0.5)'        -ForegroundColor Cyan
         Write-Host '=====================================================' -ForegroundColor Cyan
 
-        $upn = Read-Host 'Your email (UPN)'
+        $cfg = Get-ToolkitConfig
+        $upnPrompt = if ($cfg.Upn) { "Your email (UPN) [Enter = $($cfg.Upn)]" } else { 'Your email (UPN)' }
+        $upn = Read-Host $upnPrompt
+        if ([string]::IsNullOrWhiteSpace($upn) -and $cfg.Upn) { $upn = $cfg.Upn }
 
         $connected = @{}   # ServiceName -> $true
         while ($true) {
-            # Choose / switch service.
-            $svcName = Get-MenuChoice -Title 'Connect to which service?' `
-                        -Options ($Services.Name + 'Quit')
+            # Choose / switch service - offer the last-used one first.
+            $svcNames = @($Services.Name)
+            if ($cfg.LastService -and ($svcNames -contains $cfg.LastService)) {
+                $svcNames = @($cfg.LastService) + @($svcNames | Where-Object { $_ -ne $cfg.LastService })
+            }
+            $svcName = Get-MenuChoice -Title 'Connect to which service?' -Options ($svcNames + 'Quit')
             if ($svcName -eq 'Quit') { break }
 
             $service = $Services | Where-Object { $_.Name -eq $svcName }
             if (-not $connected[$svcName]) {
                 Connect-M365Service -Service $service -Upn $upn
                 $connected[$svcName] = $true
+                Show-WhoAmI -Service $service -Upn $upn
             }
+            Save-ToolkitConfig -Upn $upn -LastService $svcName
 
             # Inner loop: pick and run actions for this service.
             while ($true) {
@@ -735,8 +846,25 @@ function Start-M365Toolkit {
 
                 $categories = @($svcActions.Category | Select-Object -Unique)
                 $cat = Get-MenuChoice -Title "[$svcName] Choose a category" `
-                            -Options (@($categories) + 'Run any command by name (advanced)' + 'Switch service') -AllowBack
+                            -Options (@($categories) + 'Search actions by keyword' + 'Run any command by name (advanced)' + 'Switch service') -AllowBack
                 if (-not $cat -or $cat -eq 'Switch service') { break }
+
+                # Keyword search across this service's actions (name / cmdlet / category).
+                if ($cat -eq 'Search actions by keyword') {
+                    $kw = (Read-Host 'Keyword (matches action name, cmdlet, or category)').Trim()
+                    if ($kw) {
+                        $rx = [regex]::Escape($kw)
+                        $hits = @($svcActions | Where-Object { $_.Label -match $rx -or $_.Cmdlet -match $rx -or $_.Category -match $rx })
+                        if ($hits.Count -eq 0) { Write-Host "No actions match '$kw'." -ForegroundColor Yellow }
+                        else {
+                            $lbl = Get-MenuChoice -Title "Actions matching '$kw'" `
+                                        -Options $hits.Label `
+                                        -Descriptions @($hits | ForEach-Object { [string]$_.Help }) -AllowBack
+                            if ($lbl) { Invoke-Action -Action ($hits | Where-Object { $_.Label -eq $lbl } | Select-Object -First 1) }
+                        }
+                    }
+                    continue
+                }
 
                 # Escape hatch: drive ANY cmdlet in this connected module by name.
                 if ($cat -eq 'Run any command by name (advanced)') {
@@ -760,17 +888,8 @@ function Start-M365Toolkit {
                             -AllowBack
                 if (-not $label) { continue }
 
-                $action = $catActions | Where-Object { $_.Label -eq $label }
-                $mode = Get-MenuChoice -Title "How do you want to run '$($action.Label)'?" `
-                            -Options @('Run once (type the values now)','Bulk - run for every row in a CSV file') -AllowBack
-                if ($mode) {
-                    if ($mode -like 'Bulk*') {
-                        Invoke-BulkCmdlet  -Cmdlet $action.Cmdlet -Prompt $action.Prompt -ParamHelp $action.ParamHelp -Preset $action.Preset
-                    } else {
-                        Invoke-GuidedCmdlet -Cmdlet $action.Cmdlet -Prompt $action.Prompt -Help $action.Help -ParamHelp $action.ParamHelp -Preset $action.Preset
-                    }
-                    Read-Host 'Press Enter to continue' | Out-Null
-                }
+                $action = $catActions | Where-Object { $_.Label -eq $label } | Select-Object -First 1
+                Invoke-Action -Action $action
             }
         }
         Write-Host 'Goodbye.' -ForegroundColor Cyan

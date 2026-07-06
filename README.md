@@ -90,6 +90,12 @@ the catalogued actions — it can drive *any* cmdlet the connected module expose
 show them as a table, show only columns you choose, or **export to CSV** (all columns or a
 chosen subset). CSVs default to `.\exports\<cmdlet>-<timestamp>.csv`.
 
+**Convenience:** the tool remembers your email (UPN) and last-used service between runs
+(stored in `config.json`, never committed); after connecting it shows **who you're signed
+in as** (and your Graph scopes / Exchange org); every category menu has **Search actions by
+keyword**; and for identity fields you can type **`find`** to search the directory and pick a
+person or mailbox from a list instead of typing the address.
+
 ## Add a new action (the common case)
 
 Append one entry to `$Actions` in `Invoke-M365Toolkit.ps1`:
@@ -115,6 +121,8 @@ proxy cmdlets that expose things as `Object[]`), teach the tool by adding a row 
 
 ## Status / roadmap
 
+- **v0.5 (2026-07-06):** remembers UPN + last-used service; "who am I" preflight after
+  connect; **Search actions by keyword**; `find` directory lookup for identity fields.
 - **v0.4 (2026-07-06):** three more services wired — **SharePoint Admin (SPO)**,
   **Intune / Devices (Graph)**, **Power Platform (admin)** — each with a starter list action.
   (Runs from this Mac copy; no VM involved.)
