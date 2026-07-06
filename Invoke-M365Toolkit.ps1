@@ -901,20 +901,34 @@ function Show-WhoAmI {
 }
 
 # ---------------------------------------------------------------------------
+# After an action finishes, ask what to do next. Returns 'again' (back to the
+# category menu for this service), 'switch' (pick another service), or 'quit'.
+# ---------------------------------------------------------------------------
+function Get-NextStep {
+    switch (Get-MenuChoice -Title 'What next?' -Options @(
+                'Do another task (same service)','Switch service','Quit')) {
+        'Switch service' { 'switch' }
+        'Quit'           { 'quit' }
+        default          { 'again' }
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Given a catalogued action, ask run-once vs bulk and dispatch. Shared by the
-# category browser and the keyword search.
+# category browser and the keyword search. Returns the Get-NextStep directive
+# ('again' if the user backed out before running anything).
 # ---------------------------------------------------------------------------
 function Invoke-Action {
     param([Parameter(Mandatory)] $Action)
     $mode = Get-MenuChoice -Title "How do you want to run '$($Action.Label)'?" `
                 -Options @('Run once (type the values now)','Bulk - run for every row in a CSV file') -AllowBack
-    if (-not $mode) { return }
+    if (-not $mode) { return 'again' }
     if ($mode -like 'Bulk*') {
         Invoke-BulkCmdlet  -Cmdlet $Action.Cmdlet -Prompt $Action.Prompt -ParamHelp $Action.ParamHelp -Preset $Action.Preset
     } else {
         Invoke-GuidedCmdlet -Cmdlet $Action.Cmdlet -Prompt $Action.Prompt -Help $Action.Help -ParamHelp $Action.ParamHelp -Preset $Action.Preset
     }
-    Read-Host 'Press Enter to continue' | Out-Null
+    Get-NextStep
 }
 
 # ===========================================================================
@@ -937,6 +951,7 @@ function Start-M365Toolkit {
         if ([string]::IsNullOrWhiteSpace($upn) -and $cfg.Upn) { $upn = $cfg.Upn }
 
         $connected = @{}   # ServiceName -> $true
+        $quit = $false
         while ($true) {
             # Choose / switch service - offer the last-used one first.
             $svcNames = @($Services.Name)
@@ -978,7 +993,11 @@ function Start-M365Toolkit {
                             $lbl = Get-MenuChoice -Title "Actions matching '$kw'" `
                                         -Options $hits.Label `
                                         -Descriptions @($hits | ForEach-Object { [string]$_.Help }) -AllowBack
-                            if ($lbl) { Invoke-Action -Action ($hits | Where-Object { $_.Label -eq $lbl } | Select-Object -First 1) }
+                            if ($lbl) {
+                                $post = Invoke-Action -Action ($hits | Where-Object { $_.Label -eq $lbl } | Select-Object -First 1)
+                                if ($post -eq 'quit')   { $quit = $true; break }
+                                if ($post -eq 'switch') { break }
+                            }
                         }
                     }
                     continue
@@ -994,7 +1013,9 @@ function Start-M365Toolkit {
                             if     ($mode -like 'Bulk*') { Invoke-BulkCmdlet  -Cmdlet $cmdName }
                             elseif ($mode)               { Invoke-GuidedCmdlet -Cmdlet $cmdName }
                         } catch { Write-Host ("Could not run '{0}': {1}" -f $cmdName, $_.Exception.Message) -ForegroundColor Red }
-                        Read-Host 'Press Enter to continue' | Out-Null
+                        $post = Get-NextStep
+                        if ($post -eq 'quit')   { $quit = $true; break }
+                        if ($post -eq 'switch') { break }
                     }
                     continue
                 }
@@ -1007,8 +1028,11 @@ function Start-M365Toolkit {
                 if (-not $label) { continue }
 
                 $action = $catActions | Where-Object { $_.Label -eq $label } | Select-Object -First 1
-                Invoke-Action -Action $action
+                $post = Invoke-Action -Action $action
+                if ($post -eq 'quit')   { $quit = $true; break }
+                if ($post -eq 'switch') { break }
             }
+            if ($quit) { break }
         }
         Write-Host 'Goodbye.' -ForegroundColor Cyan
     }
