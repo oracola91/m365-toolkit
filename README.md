@@ -1,0 +1,119 @@
+# M365 Guided Command Builder
+
+A plain-language, menu-driven PowerShell tool so the IT team can run Microsoft 365
+admin commands **without memorizing cmdlet names or syntax**. You pick an action in
+human language and the tool walks you through the parameters one at a time, shows you
+the exact command it will run (dry-run), and only runs it when you confirm.
+
+## How it works (independent layers, each extended by adding one row)
+
+1. **Connection registry** (`$Services`) — one row per M365 service. On launch you
+   enter your email and choose which service to connect to (Exchange Online, Entra/Graph,
+   SharePoint/PnP, Teams, Security & Compliance, SharePoint Admin/SPO, Intune/Devices,
+   Power Platform). Add a service = add one row.
+2. **Introspection engine** (`Invoke-GuidedCmdlet` / `Get-CmdletParameters`) — the clever
+   bit. It reads the *real* parameters straight off the cmdlet with
+   `(Get-Command X).Parameters`, so it's always accurate and never goes stale. It sorts
+   them into **Required → Optional → Switches**, and for each one it works out the allowed
+   values from a `[ValidateSet]`, an **enum type**, or the manual `$ParamHints` table, then
+   offers them as a numbered pick or lists them inline (type `?` at any prompt to see them).
+   Works for *any* cmdlet in *any* connected module — no per-command code.
+3. **Plain-language catalogue** (`$Actions`) — the only per-command work: a friendly
+   `Label → Cmdlet` mapping, grouped by category, with optional `Help`, per-parameter
+   `ParamHelp` (who → whom), and `Preset` values the action fixes for you. Add an
+   action = add one row.
+4. **Bulk runner** (`Invoke-BulkCmdlet`) — run the *same* action once per row of a CSV.
+   You map each parameter to a CSV column or a fixed value, preview the first row, then
+   it runs them all with a per-row success/fail tally.
+
+## Run it
+
+In PowerShell on any Windows box that has the relevant modules:
+
+```powershell
+cd M365Toolkit
+# Safe first run: preview commands, never execute anything
+.\Invoke-M365Toolkit.ps1 -DryRunOnly
+# Normal run (asks y/n before running each command)
+.\Invoke-M365Toolkit.ps1
+```
+
+If a required module isn't installed, the tool offers to install it for the current user.
+
+- Uses **your signed-in admin's RBAC role** — a helpdesk member can only do what their
+  role permits.
+- Every session is transcript-logged to `.\logs\session-<timestamp>.log` for audit.
+- At any parameter prompt, type **`?`** to list the allowed values. In the category and
+  action menus, type **`?`** for a short explanation of each choice.
+
+## What you can do
+
+Catalogued actions cover the common jobs, grouped by category:
+
+- **Mailbox access** — grant/remove access to a mailbox, Send As.
+- **Shared mailboxes** — create a shared mailbox, convert an existing mailbox to shared,
+  give Full Access with control over auto-mapping.
+- **Mailboxes** — look up a mailbox, change a mailbox setting.
+- **Groups** — add a member to a distribution group.
+- **Users** (Graph) — look up a user.
+- **Sites** (SharePoint Admin/SPO) — list all SharePoint sites.
+- **Devices** (Intune/Graph) — list enrolled devices.
+- **Environments** (Power Platform) — list environments.
+
+**Beyond the catalogue — full capability:** every category menu has a
+**"Run any command by name (advanced)"** option. Type any cmdlet in the connected module
+and the engine guides its parameters exactly the same way. So the tool is not limited to
+the catalogued actions — it can drive *any* cmdlet the connected module exposes.
+
+**Run once or in bulk:** after choosing an action (or a run-any cmdlet) you pick
+**Run once** (type the values now) or **Bulk from a CSV file** (run it for every row).
+
+**Results / export:** when a command returns objects (e.g. a lookup), the tool offers to
+show them as a table, show only columns you choose, or **export to CSV** (all columns or a
+chosen subset). CSVs default to `.\exports\<cmdlet>-<timestamp>.csv`.
+
+## Add a new action (the common case)
+
+Append one entry to `$Actions` in `Invoke-M365Toolkit.ps1`:
+
+```powershell
+[pscustomobject]@{
+    Service   = 'Exchange Online'
+    Category  = 'Mailboxes'
+    Label     = 'Hide a mailbox from the address list'
+    Cmdlet    = 'Set-Mailbox'
+    Prompt    = @('Identity','HiddenFromAddressListsEnabled')  # params to always walk (required OR optional)
+    Preset    = @{ }                 # optional: values the action fixes, never prompted (e.g. @{ Type='Shared' })
+    Help      = 'One-line description shown when building and via ? in the menu.'
+    ParamHelp = @{ Identity = 'The mailbox to change' }        # optional: who -> whom, per parameter
+}
+```
+
+That's it — the engine discovers and validates the parameters for you.
+
+If a parameter has fixed values but the cmdlet hides them (common with Exchange Online
+proxy cmdlets that expose things as `Object[]`), teach the tool by adding a row to
+`$ParamHints` (keyed by parameter name), e.g. `AccessRights = @('FullAccess','SendAs',...)`.
+
+## Status / roadmap
+
+- **v0.4 (2026-07-06):** three more services wired — **SharePoint Admin (SPO)**,
+  **Intune / Devices (Graph)**, **Power Platform (admin)** — each with a starter list action.
+  (Runs from this Mac copy; no VM involved.)
+- **v0.3 (2026-07-06):** result handling — after a command returns objects you can show a
+  table, choose columns, or export to CSV (all or chosen columns) to `.\exports\`.
+- **v0.2 (2026-07-03):** enum + `$ParamHints` value discovery with `?` to list options;
+  per-parameter plain-language help (who → whom); `?` help in the menus; `Preset` values;
+  **Shared mailboxes** category; **run-any-cmdlet** escape hatch; **CSV bulk mode**.
+- **v0.1 (2026-07-03):** connection registry, introspection wizard, dry-run preview,
+  transcript logging, a small starter catalogue.
+- **Next / still missing:**
+  - Parameter *sets* aren't handled — cmdlets with mutually-exclusive parameter groups
+    show all parameters mixed together.
+  - Legacy AzureAD/MSOnline are retired (not wired, and not worth adding — migrate to Graph).
+  - Interactive auth only — no app-only/certificate auth for unattended/scheduled runs.
+  - No undo, and destructive cmdlets get the same y/n prompt as a lookup.
+  - Optional plain-English → cmdlet layer (via the Claude API) so you can type a request
+    instead of navigating menus.
+
+Design notes live in the second brain: `second-brain/Knowledge/Office 365 PowerShell reference.md`.

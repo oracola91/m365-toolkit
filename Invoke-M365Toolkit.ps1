@@ -1,0 +1,783 @@
+<#
+.SYNOPSIS
+    Guided, plain-language command builder for Microsoft 365 PowerShell.
+
+.DESCRIPTION
+    You never memorize cmdlet names or syntax. Launch the tool, enter your email,
+    choose which M365 service to connect to, then browse by category and pick an
+    action in plain language. The tool introspects the real cmdlet, walks you
+    through its parameters (Required -> Optional -> Switches) in human terms,
+    shows a dry-run preview of the assembled command, and only runs it when you
+    confirm. Everything is transcript-logged for an audit trail.
+
+    Architecture (three independent layers, each extended by adding one row):
+      1. $Services  - connection registry: one row per M365 service.
+      2. Invoke-GuidedCmdlet - generic introspection engine, works for ANY cmdlet.
+      3. $Actions   - plain-language catalogue: friendly label -> cmdlet.
+
+.NOTES
+    Skeleton / v0.1 - 2026-07-03. Runs on Windows PowerShell 5.1 or PowerShell 7+.
+    Requires the relevant module installed for whichever service you connect to.
+#>
+
+[CmdletBinding()]
+param(
+    # Skip the run confirmation and only ever show the preview (never execute).
+    [switch]$DryRunOnly
+)
+
+$ErrorActionPreference = 'Stop'
+
+# Where logs and CSV exports go. Prefer the script's own folder, but when the
+# tool is run remotely (irm <URL> | iex) there is no script file on disk, so
+# $PSScriptRoot is empty - fall back to the user's profile / home folder.
+$script:ToolkitHome =
+    if     ($PSScriptRoot)     { $PSScriptRoot }
+    elseif ($env:USERPROFILE)  { Join-Path $env:USERPROFILE 'M365Toolkit' }
+    else                       { Join-Path $HOME 'M365Toolkit' }
+
+# ---------------------------------------------------------------------------
+# Layer 1: Connection registry. Add a service = add one row here.
+# ---------------------------------------------------------------------------
+$Services = @(
+    [pscustomobject]@{
+        Name        = 'Exchange Online'
+        Module      = 'ExchangeOnlineManagement'
+        ConnectCmd  = 'Connect-ExchangeOnline'
+        # Builds the parameter splat for the connect cmdlet from the entered email.
+        ConnectArgs = { param($Upn) @{ UserPrincipalName = $Upn; ShowBanner = $false } }
+        Disconnect  = 'Disconnect-ExchangeOnline'
+    }
+    [pscustomobject]@{
+        Name        = 'Entra / Identity (Graph)'
+        Module      = 'Microsoft.Graph'
+        ConnectCmd  = 'Connect-MgGraph'
+        ConnectArgs = { param($Upn) @{ Scopes = 'User.ReadWrite.All','Group.ReadWrite.All' } }
+        Disconnect  = 'Disconnect-MgGraph'
+    }
+    [pscustomobject]@{
+        Name        = 'SharePoint Online (PnP)'
+        Module      = 'PnP.PowerShell'
+        ConnectCmd  = 'Connect-PnPOnline'
+        ConnectArgs = { param($Upn) @{ Url = (Read-Host 'SharePoint site/admin URL'); Interactive = $true } }
+        Disconnect  = 'Disconnect-PnPOnline'
+    }
+    [pscustomobject]@{
+        Name        = 'Microsoft Teams'
+        Module      = 'MicrosoftTeams'
+        ConnectCmd  = 'Connect-MicrosoftTeams'
+        ConnectArgs = { param($Upn) @{ AccountId = $Upn } }
+        Disconnect  = 'Disconnect-MicrosoftTeams'
+    }
+    [pscustomobject]@{
+        Name        = 'Security & Compliance (Purview)'
+        Module      = 'ExchangeOnlineManagement'   # Connect-IPPSSession ships inside EXO module
+        ConnectCmd  = 'Connect-IPPSSession'
+        ConnectArgs = { param($Upn) @{ UserPrincipalName = $Upn } }
+        Disconnect  = $null
+    }
+    [pscustomobject]@{
+        Name        = 'SharePoint Admin (SPO)'
+        Module      = 'Microsoft.Online.SharePoint.PowerShell'
+        ConnectCmd  = 'Connect-SPOService'
+        # Tenant admin cmdlets (Get-SPOSite, Set-SPOTenant...). Needs the -admin URL.
+        ConnectArgs = { param($Upn) @{ Url = (Read-Host 'SharePoint ADMIN URL (e.g. https://shelly-admin.sharepoint.com)') } }
+        Disconnect  = 'Disconnect-SPOService'
+    }
+    [pscustomobject]@{
+        Name        = 'Intune / Devices (Graph)'
+        Module      = 'Microsoft.Graph'
+        ConnectCmd  = 'Connect-MgGraph'
+        # Same Graph SDK as Entra, but consented for device-management scopes.
+        ConnectArgs = { param($Upn) @{ Scopes = 'DeviceManagementManagedDevices.ReadWrite.All','DeviceManagementConfiguration.ReadWrite.All' } }
+        Disconnect  = 'Disconnect-MgGraph'
+    }
+    [pscustomobject]@{
+        Name        = 'Power Platform (admin)'
+        Module      = 'Microsoft.PowerApps.Administration.PowerShell'
+        ConnectCmd  = 'Add-PowerAppsAccount'   # opens an interactive sign-in
+        ConnectArgs = { param($Upn) @{ } }
+        Disconnect  = 'Remove-PowerAppsAccount'
+    }
+)
+
+# ---------------------------------------------------------------------------
+# Layer 3: Plain-language action catalogue. Add an action = add one row here.
+# Cmdlet is the ONLY thing you must name; parameters are discovered by layer 2.
+# 'Prompt' (optional) curates which params to walk first; if omitted, the engine
+# walks all Required params and then offers the full Optional/Switch lists.
+# ---------------------------------------------------------------------------
+$Actions = @(
+    [pscustomobject]@{
+        Service='Exchange Online'; Category='Mailbox access'
+        Label='Give a user access to another mailbox (incl. shared mailboxes)'
+        Cmdlet='Add-MailboxPermission'; Prompt=@('Identity','User','AccessRights')
+        Help='Grant ONE person the right to open/manage ANOTHER mailbox (a colleague''s or a shared mailbox).'
+        ParamHelp=@{
+            Identity     = 'The mailbox that will BE accessed - whose inbox is opened (e.g. a shared mailbox, or a colleague)'
+            User         = 'The person who will GET the access'
+            AccessRights = 'What they may do. FullAccess = open & manage everything (Send As is a separate action)'
+        }
+    }
+    [pscustomobject]@{
+        Service='Exchange Online'; Category='Mailbox access'
+        Label='Remove a user''s access to a mailbox'
+        Cmdlet='Remove-MailboxPermission'; Prompt=@('Identity','User','AccessRights')
+        Help='Take away access that was previously granted.'
+        ParamHelp=@{
+            Identity     = 'The mailbox that WAS being accessed'
+            User         = 'The person who will LOSE the access'
+            AccessRights = 'Which right to remove (usually FullAccess)'
+        }
+    }
+    [pscustomobject]@{
+        Service='Exchange Online'; Category='Mailbox access'
+        Label='Let a user send AS another mailbox (Send As)'
+        Cmdlet='Add-RecipientPermission'; Prompt=@('Identity','Trustee','AccessRights')
+        Help='Let a person send email that appears to come FROM another mailbox.'
+        ParamHelp=@{
+            Identity     = 'The mailbox that mail will appear to come FROM'
+            Trustee      = 'The person who will be allowed to send as it'
+            AccessRights = 'Always SendAs for this action'
+        }
+    }
+    [pscustomobject]@{
+        Service='Exchange Online'; Category='Mailboxes'; Label='Look up a mailbox'
+        Cmdlet='Get-EXOMailbox'; Prompt=@('Identity')
+        Help='Show details about a mailbox.'
+        ParamHelp=@{ Identity='The mailbox to look up (email address or name)' }
+    }
+    [pscustomobject]@{
+        Service='Exchange Online'; Category='Mailboxes'; Label='Change a mailbox setting'
+        Cmdlet='Set-Mailbox'; Prompt=$null
+        Help='Change a setting on a mailbox (advanced - walks all available options).'
+    }
+    [pscustomobject]@{
+        Service='Exchange Online'; Category='Shared mailboxes'
+        Label='Create a new shared mailbox'
+        Cmdlet='New-Mailbox'; Prompt=@('Name','DisplayName','PrimarySmtpAddress')
+        Preset=@{ Shared=$true }
+        Help='Create a brand-new shared mailbox (no license needed, no password).'
+        ParamHelp=@{
+            Name               = 'Internal name / alias, no spaces (e.g. sales)'
+            DisplayName        = 'Friendly name shown to people (e.g. Sales Team)'
+            PrimarySmtpAddress = 'The email address for it (e.g. sales@shelly.com)'
+        }
+    }
+    [pscustomobject]@{
+        Service='Exchange Online'; Category='Shared mailboxes'
+        Label='Convert an existing mailbox to shared'
+        Cmdlet='Set-Mailbox'; Prompt=@('Identity')
+        Preset=@{ Type='Shared' }
+        Help='Turn a normal user mailbox into a shared mailbox (e.g. after someone leaves). Free up the license afterwards.'
+        ParamHelp=@{ Identity='The mailbox to convert (email address or name)' }
+    }
+    [pscustomobject]@{
+        Service='Exchange Online'; Category='Shared mailboxes'
+        Label='Give Full Access to a shared mailbox (set auto-mapping)'
+        Cmdlet='Add-MailboxPermission'; Prompt=@('Identity','User','AutoMapping')
+        Preset=@{ AccessRights='FullAccess' }
+        Help='Grant Full Access and choose whether the shared mailbox auto-appears in the person''s Outlook.'
+        ParamHelp=@{
+            Identity    = 'The shared mailbox being accessed'
+            User        = 'The person who will GET access'
+            AutoMapping = 'true = it appears automatically in their Outlook; false = they add it manually'
+        }
+    }
+    [pscustomobject]@{
+        Service='Exchange Online'; Category='Groups'; Label='Add a member to a distribution group'
+        Cmdlet='Add-DistributionGroupMember'; Prompt=@('Identity','Member')
+        Help='Add someone to a distribution / mailing group.'
+        ParamHelp=@{ Identity='The group to add TO'; Member='The person being ADDED' }
+    }
+    [pscustomobject]@{
+        Service='Entra / Identity (Graph)'; Category='Users'; Label='Look up a user'
+        Cmdlet='Get-MgUser'; Prompt=@('UserId')
+        Help='Show details about a user account.'
+        ParamHelp=@{ UserId='The user to look up (email or object id)' }
+    }
+    [pscustomobject]@{
+        Service='SharePoint Admin (SPO)'; Category='Sites'; Label='List all SharePoint sites'
+        Cmdlet='Get-SPOSite'; Prompt=$null
+        Help='List the site collections in the tenant (add -Limit All to see every one).'
+    }
+    [pscustomobject]@{
+        Service='Intune / Devices (Graph)'; Category='Devices'; Label='List enrolled devices'
+        Cmdlet='Get-MgDeviceManagementManagedDevice'; Prompt=$null
+        Help='List devices enrolled in Intune.'
+    }
+    [pscustomobject]@{
+        Service='Power Platform (admin)'; Category='Environments'; Label='List Power Platform environments'
+        Cmdlet='Get-AdminPowerAppEnvironment'; Prompt=$null
+        Help='List the Power Platform environments in the tenant.'
+    }
+)
+
+# ---------------------------------------------------------------------------
+# Optional value hints. Some cmdlets have a fixed set of allowed values but do
+# not advertise it in a way the engine can read - e.g. Exchange Online proxy
+# cmdlets expose -AccessRights as a plain Object[] with no ValidateSet or enum.
+# List those values here and the tool will offer them. Keyed by parameter name
+# (case-insensitive). Teaching the tool a new field = adding one row.
+# ---------------------------------------------------------------------------
+$ParamHints = @{
+    AccessRights = @('FullAccess','SendAs','ExternalAccount','DeleteItem','ReadPermission','ChangePermission','ChangeOwner')
+}
+
+# ---------------------------------------------------------------------------
+# Small UI helper: print a numbered menu and return the chosen item (or $null).
+# ---------------------------------------------------------------------------
+function Get-MenuChoice {
+    param(
+        [Parameter(Mandatory)] [string]   $Title,
+        [Parameter(Mandatory)] [string[]] $Options,
+        [string[]] $Descriptions,   # optional, parallel to $Options: shown when the user types ?
+        [switch] $AllowBack
+    )
+    Write-Host ''
+    Write-Host $Title -ForegroundColor Cyan
+    for ($i = 0; $i -lt $Options.Count; $i++) {
+        Write-Host ('  {0,2}. {1}' -f ($i + 1), $Options[$i])
+    }
+    if ($AllowBack) { Write-Host '   0. Back' -ForegroundColor DarkGray }
+    if ($Descriptions) { Write-Host '   (type ? for a short explanation of each choice)' -ForegroundColor DarkGray }
+    while ($true) {
+        $raw = Read-Host 'Choose a number'
+        if ($raw -eq '?' -and $Descriptions) {
+            for ($i = 0; $i -lt $Options.Count; $i++) {
+                Write-Host ('  {0,2}. {1}' -f ($i + 1), $Options[$i]) -ForegroundColor White
+                $d = if ($i -lt $Descriptions.Count) { $Descriptions[$i] } else { '' }
+                if ($d) { Write-Host ('        {0}' -f $d) -ForegroundColor DarkGray }
+            }
+            continue
+        }
+        if ($AllowBack -and $raw -eq '0') { return $null }
+        if ($raw -match '^\d+$' -and [int]$raw -ge 1 -and [int]$raw -le $Options.Count) {
+            return $Options[[int]$raw - 1]
+        }
+        Write-Host 'Not a valid choice, try again.' -ForegroundColor Yellow
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Layer 1 driver: connect to a chosen service using the entered email.
+# ---------------------------------------------------------------------------
+function Connect-M365Service {
+    param(
+        [Parameter(Mandatory)] [pscustomobject] $Service,
+        [Parameter(Mandatory)] [string]         $Upn
+    )
+    if (-not (Get-Module -ListAvailable -Name $Service.Module)) {
+        Write-Host ("Module '{0}' is not installed." -f $Service.Module) -ForegroundColor Yellow
+        if ((Read-Host 'Install it now for the current user? (y/n)') -match '^(y|yes)$') {
+            Install-Module $Service.Module -Scope CurrentUser -Force
+        } else {
+            throw "Cannot connect without module '$($Service.Module)'."
+        }
+    }
+    Import-Module $Service.Module -ErrorAction SilentlyContinue
+    $connectArgs = & $Service.ConnectArgs $Upn
+    Write-Host ("Connecting to {0} as {1} ..." -f $Service.Name, $Upn) -ForegroundColor Cyan
+    & $Service.ConnectCmd @connectArgs
+    Write-Host ("Connected to {0}." -f $Service.Name) -ForegroundColor Green
+}
+
+# ---------------------------------------------------------------------------
+# Render an assembled splat as a copy-pasteable command line (for the preview).
+# ---------------------------------------------------------------------------
+function Format-CommandPreview {
+    param(
+        [Parameter(Mandatory)] [string]    $Cmdlet,
+        [Parameter(Mandatory)] [hashtable] $BoundParams
+    )
+    $sb = [System.Text.StringBuilder]::new($Cmdlet)
+    foreach ($key in $BoundParams.Keys) {
+        $val = $BoundParams[$key]
+        if ($val -is [switch]) {
+            if ($val.IsPresent) { [void]$sb.Append(" -$key") }
+        } elseif ($val -is [bool]) {
+            [void]$sb.Append(" -$key `$$($val.ToString().ToLower())")
+        } elseif ($val -is [array]) {
+            [void]$sb.Append(" -$key " + (($val | ForEach-Object { "'$_'" }) -join ','))
+        } elseif ("$val" -match '\s') {
+            [void]$sb.Append(" -$key '$val'")
+        } else {
+            [void]$sb.Append(" -$key $val")
+        }
+    }
+    $sb.ToString()
+}
+
+# ---------------------------------------------------------------------------
+# Shared introspection: read a cmdlet's real parameters and sort them into
+# Required / Optional / Switches (dropping PowerShell's common params). Used by
+# both the guided (one-at-a-time) and bulk (CSV) runners so they stay in sync.
+# ---------------------------------------------------------------------------
+function Get-CmdletParameters {
+    param([Parameter(Mandatory)] $Cmd)
+    $common = [System.Management.Automation.PSCmdlet]::CommonParameters +
+              [System.Management.Automation.PSCmdlet]::OptionalCommonParameters
+    $all = $Cmd.Parameters.Values | Where-Object { $common -notcontains $_.Name }
+    $isMandatory = { param($p) ($p.Attributes | Where-Object {
+        $_ -is [System.Management.Automation.ParameterAttribute] -and $_.Mandatory }) -ne $null }
+    [pscustomobject]@{
+        Required = @($all | Where-Object { & $isMandatory $_ })
+        Switches = @($all | Where-Object { -not (& $isMandatory $_) -and $_.SwitchParameter })
+        Optional = @($all | Where-Object { -not (& $isMandatory $_) -and -not $_.SwitchParameter })
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Layer 2: the generic introspection engine. Given a cmdlet name it discovers
+# the real parameters, categorises them, prompts in plain language, previews,
+# and runs. Works for ANY cmdlet in ANY connected module - no per-cmdlet code.
+# ---------------------------------------------------------------------------
+function Invoke-GuidedCmdlet {
+    param(
+        [Parameter(Mandatory)] [string]   $Cmdlet,
+        [string[]]  $Prompt,     # curated params to always walk (required OR optional), in order
+        [string]    $Help,       # optional one-line plain description of the whole action
+        [hashtable] $ParamHelp,  # optional per-parameter plain descriptions (name -> text)
+        [hashtable] $Preset      # optional param values fixed by the action (never prompted)
+    )
+
+    $cmd      = Get-Command $Cmdlet -ErrorAction Stop
+    $parts    = Get-CmdletParameters -Cmd $cmd
+    $required = $parts.Required
+    $switches = $parts.Switches
+    $optional = $parts.Optional
+
+    Write-Host ''
+    Write-Host ("Building: {0}" -f $Cmdlet) -ForegroundColor Cyan
+    if ($Help) { Write-Host ("  {0}" -f $Help) -ForegroundColor Gray }
+    Write-Host ("  {0} required, {1} optional, {2} switches" -f $required.Count, $optional.Count, $switches.Count) -ForegroundColor DarkGray
+
+    $bound = [ordered]@{}
+
+    # ---- Presets: values fixed by the action itself (e.g. -Shared for a shared
+    #      mailbox, -Type Shared to convert). Bound automatically, shown in the
+    #      preview, never prompted for.
+    if ($Preset) {
+        foreach ($k in $Preset.Keys) { $bound[$k] = $Preset[$k] }
+        Write-Host ('  Fixed by this action: ' + (($Preset.Keys | ForEach-Object { "-$_ $($Preset[$_])" }) -join ', ')) -ForegroundColor DarkGray
+    }
+    $promptList = @($Prompt)   # params to always walk, even if optional
+
+    # ---- Required params: always prompt, in curated order, skipping any preset.
+    $reqOrdered = if ($Prompt) {
+        @($Prompt | ForEach-Object { $n = $_; $required | Where-Object { $_.Name -eq $n } }) +
+        @($required | Where-Object { $Prompt -notcontains $_.Name })
+    } else { $required }
+
+    foreach ($p in ($reqOrdered | Where-Object { $_ -and -not $bound.Contains($_.Name) })) {
+        $desc = if ($ParamHelp) { $ParamHelp[$p.Name] } else { $null }
+        $bound[$p.Name] = Read-ParameterValue -Param $p -Required -Description $desc
+    }
+
+    # ---- Optional params named in the curated list: ask them outright.
+    foreach ($p in ($optional | Where-Object { $promptList -contains $_.Name -and -not $bound.Contains($_.Name) })) {
+        $desc = if ($ParamHelp) { $ParamHelp[$p.Name] } else { $null }
+        $v = Read-ParameterValue -Param $p -Description $desc
+        if ($null -ne $v) { $bound[$p.Name] = $v }
+    }
+
+    # ---- Remaining optional params: offer the list, let the user pick which to set.
+    $optRest = @($optional | Where-Object { -not $bound.Contains($_.Name) })
+    if ($optRest.Count -gt 0) {
+        Write-Host ''
+        Write-Host 'Optional parameters you can set:' -ForegroundColor Cyan
+        for ($i = 0; $i -lt $optRest.Count; $i++) {
+            Write-Host ('  {0,2}. {1}  ({2})' -f ($i+1), $optRest[$i].Name, $optRest[$i].ParameterType.Name)
+        }
+        $pick = Read-Host 'Enter numbers to set (comma-separated), or press Enter to skip'
+        foreach ($n in ($pick -split '[,\s]+' | Where-Object { $_ -match '^\d+$' })) {
+            $idx = [int]$n - 1
+            if ($idx -ge 0 -and $idx -lt $optRest.Count) {
+                $p = $optRest[$idx]
+                $desc = if ($ParamHelp) { $ParamHelp[$p.Name] } else { $null }
+                $bound[$p.Name] = Read-ParameterValue -Param $p -Description $desc
+            }
+        }
+    }
+
+    # ---- Switches: offer the list, chosen ones become $true (skip any preset).
+    $swRest = @($switches | Where-Object { -not $bound.Contains($_.Name) })
+    if ($swRest.Count -gt 0) {
+        Write-Host ''
+        Write-Host 'Switches you can enable:' -ForegroundColor Cyan
+        for ($i = 0; $i -lt $swRest.Count; $i++) {
+            Write-Host ('  {0,2}. {1}' -f ($i+1), $swRest[$i].Name)
+        }
+        $pick = Read-Host 'Enter numbers to enable (comma-separated), or press Enter to skip'
+        foreach ($n in ($pick -split '[,\s]+' | Where-Object { $_ -match '^\d+$' })) {
+            $idx = [int]$n - 1
+            if ($idx -ge 0 -and $idx -lt $swRest.Count) { $bound[$swRest[$idx].Name] = $true }
+        }
+    }
+
+    # ---- Dry-run preview + final confirm. -----------------------------------
+    $preview = Format-CommandPreview -Cmdlet $Cmdlet -BoundParams $bound
+    Write-Host ''
+    Write-Host 'Preview (dry-run):' -ForegroundColor Yellow
+    Write-Host ('  ' + $preview) -ForegroundColor White
+
+    if ($DryRunOnly) {
+        Write-Host 'DryRunOnly is set - not executing.' -ForegroundColor DarkGray
+        return
+    }
+
+    # Last confirmation: repeat the EXACT command, then require an explicit y.
+    Write-Host ''
+    Write-Host 'FINAL CONFIRMATION - about to execute this command:' -ForegroundColor Yellow
+    Write-Host ('  ' + $preview) -ForegroundColor White
+    if ((Read-Host 'Execute it now? (y/n)') -notmatch '^(y|yes)$') {
+        Write-Host 'Cancelled - nothing was run.' -ForegroundColor DarkGray
+        return
+    }
+
+    Write-Host 'Running...' -ForegroundColor Cyan
+    $result = & $Cmdlet @bound
+    Write-Host 'Done.' -ForegroundColor Green
+    Show-Result -Result $result -Cmdlet $Cmdlet
+}
+
+# ---------------------------------------------------------------------------
+# Bulk runner: run the SAME cmdlet once per row of a CSV file. You map each
+# parameter to a CSV column (per-row value) or a fixed value (same every row),
+# preview the first row, then it runs them all with a per-row success/fail tally.
+# ---------------------------------------------------------------------------
+function Invoke-BulkCmdlet {
+    param(
+        [Parameter(Mandatory)] [string] $Cmdlet,
+        [string[]]  $Prompt,
+        [hashtable] $ParamHelp,
+        [hashtable] $Preset
+    )
+    $cmd   = Get-Command $Cmdlet -ErrorAction Stop
+    $parts = Get-CmdletParameters -Cmd $cmd
+
+    $csvPath = (Read-Host 'Path to CSV file (must have a header row)').Trim('"',' ')
+    if (-not (Test-Path $csvPath)) { Write-Host "File not found: $csvPath" -ForegroundColor Red; return }
+    $rows = @(Import-Csv -Path $csvPath)
+    if ($rows.Count -eq 0) { Write-Host 'That CSV has no data rows.' -ForegroundColor Yellow; return }
+    $columns = @($rows[0].PSObject.Properties.Name)
+
+    Write-Host ''
+    Write-Host ("Loaded {0} rows. Columns: {1}" -f $rows.Count, ($columns -join ', ')) -ForegroundColor Cyan
+    Write-Host 'For each parameter: type a COLUMN name (uses each row''s value), or =value for a fixed value on every row, or press Enter to skip.' -ForegroundColor DarkGray
+
+    # map: paramName -> @{ Kind = 'column' | 'fixed' | 'switch'; Value = ... }
+    $map = [ordered]@{}
+    if ($Preset) { foreach ($k in $Preset.Keys) { $map[$k] = @{ Kind='fixed'; Value=$Preset[$k] } } }
+
+    $askParam = {
+        param($p, $required)
+        if ($map.Contains($p.Name)) { return }
+        $desc = if ($ParamHelp) { $ParamHelp[$p.Name] } else { $null }
+        if ($desc) { Write-Host ("  -> {0}" -f $desc) -ForegroundColor Gray }
+        while ($true) {
+            $ans = Read-Host ("Map -{0} (column / =fixed / Enter){1}" -f $p.Name, $(if ($required) { ' [required]' } else { '' }))
+            if ([string]::IsNullOrWhiteSpace($ans)) {
+                if ($required) { Write-Host '  Required - give a column name or =value.' -ForegroundColor Yellow; continue }
+                return
+            }
+            if ($ans.StartsWith('=')) { $map[$p.Name] = @{ Kind='fixed'; Value=$ans.Substring(1) }; return }
+            if ($columns -contains $ans) { $map[$p.Name] = @{ Kind='column'; Value=$ans }; return }
+            Write-Host ("  '{0}' is not a column. Available: {1}" -f $ans, ($columns -join ', ')) -ForegroundColor Yellow
+        }
+    }
+
+    # Required first, in curated order.
+    $reqOrdered = if ($Prompt) {
+        @($Prompt | ForEach-Object { $n=$_; $parts.Required | Where-Object { $_.Name -eq $n } }) +
+        @($parts.Required | Where-Object { $Prompt -notcontains $_.Name })
+    } else { $parts.Required }
+    foreach ($p in ($reqOrdered | Where-Object { $_ })) { & $askParam $p $true }
+
+    # Optional: offer the list.
+    $optRest = @($parts.Optional | Where-Object { -not $map.Contains($_.Name) })
+    if ($optRest.Count -gt 0) {
+        Write-Host ''
+        Write-Host 'Optional parameters you can map:' -ForegroundColor Cyan
+        for ($i=0; $i -lt $optRest.Count; $i++) { Write-Host ('  {0,2}. {1}' -f ($i+1), $optRest[$i].Name) }
+        $pick = Read-Host 'Enter numbers to map (comma-separated), or Enter to skip'
+        foreach ($n in ($pick -split '[,\s]+' | Where-Object { $_ -match '^\d+$' })) {
+            $idx=[int]$n-1; if ($idx -ge 0 -and $idx -lt $optRest.Count) { & $askParam $optRest[$idx] $false }
+        }
+    }
+
+    # Switches: enabled for every row.
+    $swRest = @($parts.Switches | Where-Object { -not $map.Contains($_.Name) })
+    if ($swRest.Count -gt 0) {
+        Write-Host ''
+        Write-Host 'Switches to enable for every row:' -ForegroundColor Cyan
+        for ($i=0; $i -lt $swRest.Count; $i++) { Write-Host ('  {0,2}. {1}' -f ($i+1), $swRest[$i].Name) }
+        $pick = Read-Host 'Enter numbers to enable, or Enter to skip'
+        foreach ($n in ($pick -split '[,\s]+' | Where-Object { $_ -match '^\d+$' })) {
+            $idx=[int]$n-1; if ($idx -ge 0 -and $idx -lt $swRest.Count) { $map[$swRest[$idx].Name] = @{ Kind='switch'; Value=$true } }
+        }
+    }
+
+    $buildRow = {
+        param($row)
+        $b = [ordered]@{}
+        foreach ($k in $map.Keys) {
+            $m = $map[$k]
+            switch ($m.Kind) {
+                'column' { $b[$k] = $row.$($m.Value) }
+                'fixed'  { $b[$k] = $m.Value }
+                'switch' { $b[$k] = $true }
+            }
+        }
+        $b
+    }
+
+    $preview = Format-CommandPreview -Cmdlet $Cmdlet -BoundParams (& $buildRow $rows[0])
+    Write-Host ''
+    Write-Host ('Preview - first of {0} rows (dry-run):' -f $rows.Count) -ForegroundColor Yellow
+    Write-Host ('  ' + $preview) -ForegroundColor White
+
+    if ($DryRunOnly) { Write-Host 'DryRunOnly is set - not executing.' -ForegroundColor DarkGray; return }
+
+    # Last confirmation before running every row.
+    Write-Host ''
+    Write-Host ('FINAL CONFIRMATION - about to run this for ALL {0} rows, e.g.:' -f $rows.Count) -ForegroundColor Yellow
+    Write-Host ('  ' + $preview) -ForegroundColor White
+    if ((Read-Host ("Execute for all {0} rows now? (y/n)" -f $rows.Count)) -notmatch '^(y|yes)$') {
+        Write-Host 'Cancelled - nothing was run.' -ForegroundColor DarkGray; return
+    }
+
+    $ok=0; $fail=0; $i=0
+    foreach ($row in $rows) {
+        $i++
+        $splat = & $buildRow $row
+        try {
+            & $Cmdlet @splat | Out-Null
+            $ok++;  Write-Host ("  [{0}/{1}] OK" -f $i, $rows.Count) -ForegroundColor Green
+        } catch {
+            $fail++; Write-Host ("  [{0}/{1}] FAILED: {2}" -f $i, $rows.Count, $_.Exception.Message) -ForegroundColor Red
+        }
+    }
+    Write-Host ''
+    Write-Host ("Bulk done: {0} succeeded, {1} failed, {2} total." -f $ok, $fail, $rows.Count) -ForegroundColor Cyan
+}
+
+# ---------------------------------------------------------------------------
+# Prompt for a single parameter value, in plain language. ValidateSet params
+# are offered as a numbered pick; everything else gets a friendly type hint.
+# ---------------------------------------------------------------------------
+function Read-ParameterValue {
+    param(
+        [Parameter(Mandatory)] $Param,
+        [switch] $Required,
+        [string] $Description   # plain-language "what is this field?" shown above the prompt
+    )
+    $name    = $Param.Name
+    $type    = $Param.ParameterType
+    $isArray = $type.IsArray
+    $elem    = if ($isArray) { $type.GetElementType() } else { $type }
+
+    # Work out whether this field has a fixed set of allowed values, from (in order):
+    # a [ValidateSet], the values of an enum type, or our manual $ParamHints table
+    # (needed for Exchange proxy cmdlets that hide their real type as Object[]).
+    $allowed = $null
+    $validate = $Param.Attributes | Where-Object { $_ -is [System.Management.Automation.ValidateSetAttribute] } | Select-Object -First 1
+    if     ($validate)                      { $allowed = [string[]]$validate.ValidValues }
+    elseif ($elem.IsEnum)                   { $allowed = [string[]][enum]::GetNames($elem) }
+    elseif ($ParamHints.ContainsKey($name)) { $allowed = [string[]]$ParamHints[$name] }
+
+    # Say what the field means before asking for it.
+    if ($Description) { Write-Host ("  -> {0}" -f $Description) -ForegroundColor Gray }
+
+    # Single-value field with a fixed set -> numbered pick menu.
+    if ($allowed -and -not $isArray) {
+        return Get-MenuChoice -Title ("Choose a value for -{0}:" -f $name) -Options $allowed
+    }
+
+    # Otherwise a prompt line with a human-friendly hint.
+    $hint = if ($allowed) {
+        'one or more of: ' + ($allowed -join ', ')
+    } else {
+        switch -Regex ($type.Name) {
+            'Boolean'               { 'true / false' }
+            'Int|Double|Long'       { 'a number' }
+            'DateTime'              { 'a date, e.g. 2026-07-31' }
+            'String\[\]|Object\[\]' { 'one or more values, comma-separated' }
+            'String'                { 'text (e.g. an email address or name)' }
+            default                 { $type.Name }
+        }
+    }
+    $label = ('Enter -{0} [{1}]{2}' -f $name, $hint, $(if ($Required) { ' (required)' } else { '' }))
+    if ($allowed) { $label += ' - type ? to list options' }
+
+    while ($true) {
+        $val = Read-Host $label
+        if ($val -eq '?') {
+            if ($allowed) { Write-Host ('  Options: ' + ($allowed -join ', ')) -ForegroundColor Cyan }
+            else          { Write-Host '  No fixed list for this one - free text.' -ForegroundColor DarkGray }
+            continue
+        }
+        if ([string]::IsNullOrWhiteSpace($val) -and $Required) {
+            Write-Host '  This one is required.' -ForegroundColor Yellow
+            continue
+        }
+        if ([string]::IsNullOrWhiteSpace($val)) { return $null }
+        if ($isArray) { return @($val -split '[,\s]+' | Where-Object { $_ }) }
+        return $val
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Let the user pick a subset of columns from the returned objects. Enter = all.
+# ---------------------------------------------------------------------------
+function Select-ResultColumns {
+    param([Parameter(Mandatory)] $Items)
+    $cols = @($Items[0].PSObject.Properties.Name)
+    Write-Host ''
+    Write-Host 'Available columns:' -ForegroundColor Cyan
+    for ($i=0; $i -lt $cols.Count; $i++) { Write-Host ('  {0,2}. {1}' -f ($i+1), $cols[$i]) }
+    $pick = Read-Host 'Enter column numbers (comma-separated), or Enter for all'
+    $nums = @($pick -split '[,\s]+' | Where-Object { $_ -match '^\d+$' })
+    if ($nums.Count -eq 0) { return $cols }
+    $sel = foreach ($n in $nums) { $idx=[int]$n-1; if ($idx -ge 0 -and $idx -lt $cols.Count) { $cols[$idx] } }
+    @($sel)
+}
+
+# ---------------------------------------------------------------------------
+# Save objects to a CSV file, defaulting to .\exports\<cmdlet>-<timestamp>.csv.
+# ---------------------------------------------------------------------------
+function Save-ResultCsv {
+    param([Parameter(Mandatory)] $Items, [string] $Cmdlet)
+    $default = Join-Path (Join-Path $script:ToolkitHome 'exports') ("{0}-{1}.csv" -f $Cmdlet, (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    $path = Read-Host ("CSV path (Enter for {0})" -f $default)
+    if ([string]::IsNullOrWhiteSpace($path)) { $path = $default } else { $path = $path.Trim('"',' ') }
+    $dir = Split-Path -Parent $path
+    if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $Items | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
+    Write-Host ("Saved {0} row(s) to {1}" -f @($Items).Count, $path) -ForegroundColor Green
+}
+
+# ---------------------------------------------------------------------------
+# Post-run handling of whatever a cmdlet returned: show as a table (all or
+# chosen columns) or export to CSV. Scalar/string output just prints; nothing
+# returned says so. Loops so you can view AND save without re-running.
+# ---------------------------------------------------------------------------
+function Show-Result {
+    param($Result, [string] $Cmdlet)
+
+    $items = @($Result)
+    if ($items.Count -eq 0) { Write-Host 'No objects returned.' -ForegroundColor DarkGray; return }
+    Write-Host ("Returned {0} item(s)." -f $items.Count) -ForegroundColor Cyan
+
+    # Only offer table/CSV handling for real objects; scalars/strings just print.
+    $first = $items[0]
+    $isObject = $first -is [psobject] -and -not ($first -is [string]) -and -not ($first.GetType().IsPrimitive) `
+                -and @($first.PSObject.Properties).Count -gt 0
+    if (-not $isObject) {
+        $items | ForEach-Object { Write-Host ("  {0}" -f $_) }
+        return
+    }
+
+    while ($true) {
+        $choice = Get-MenuChoice -Title 'What do you want to do with the results?' -Options @(
+            'Show as a table',
+            'Show a table with only columns I choose',
+            'Save all columns to a CSV file',
+            'Save only columns I choose to a CSV file',
+            'Done'
+        )
+        switch ($choice) {
+            'Show as a table'                        { $items | Format-Table -AutoSize | Out-Host }
+            'Show a table with only columns I choose' { $c = Select-ResultColumns -Items $items; if ($c) { $items | Select-Object $c | Format-Table -AutoSize | Out-Host } }
+            'Save all columns to a CSV file'          { Save-ResultCsv -Items $items -Cmdlet $Cmdlet }
+            'Save only columns I choose to a CSV file' { $c = Select-ResultColumns -Items $items; if ($c) { Save-ResultCsv -Items ($items | Select-Object $c) -Cmdlet $Cmdlet } }
+            default { return }
+        }
+    }
+}
+
+# ===========================================================================
+# Main loop
+# ===========================================================================
+function Start-M365Toolkit {
+    $logDir = Join-Path $script:ToolkitHome 'logs'
+    if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out-Null }
+    $stamp  = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $logFile = Join-Path $logDir "session-$stamp.log"
+    Start-Transcript -Path $logFile -Append | Out-Null
+    try {
+        Write-Host '=====================================================' -ForegroundColor Cyan
+        Write-Host '  Microsoft 365 Guided Command Builder  (v0.1)'        -ForegroundColor Cyan
+        Write-Host '=====================================================' -ForegroundColor Cyan
+
+        $upn = Read-Host 'Your email (UPN)'
+
+        $connected = @{}   # ServiceName -> $true
+        while ($true) {
+            # Choose / switch service.
+            $svcName = Get-MenuChoice -Title 'Connect to which service?' `
+                        -Options ($Services.Name + 'Quit')
+            if ($svcName -eq 'Quit') { break }
+
+            $service = $Services | Where-Object { $_.Name -eq $svcName }
+            if (-not $connected[$svcName]) {
+                Connect-M365Service -Service $service -Upn $upn
+                $connected[$svcName] = $true
+            }
+
+            # Inner loop: pick and run actions for this service.
+            while ($true) {
+                $svcActions = $Actions | Where-Object { $_.Service -eq $svcName }
+                if (-not $svcActions) {
+                    Write-Host 'No plain-language actions catalogued for this service yet.' -ForegroundColor Yellow
+                    Write-Host '(You can still extend $Actions - or point the engine at any cmdlet.)' -ForegroundColor DarkGray
+                }
+
+                $categories = @($svcActions.Category | Select-Object -Unique)
+                $cat = Get-MenuChoice -Title "[$svcName] Choose a category" `
+                            -Options (@($categories) + 'Run any command by name (advanced)' + 'Switch service') -AllowBack
+                if (-not $cat -or $cat -eq 'Switch service') { break }
+
+                # Escape hatch: drive ANY cmdlet in this connected module by name.
+                if ($cat -eq 'Run any command by name (advanced)') {
+                    $cmdName = (Read-Host 'Cmdlet name (e.g. Set-Mailbox), or Enter to cancel').Trim()
+                    if ($cmdName) {
+                        $mode = Get-MenuChoice -Title "How do you want to run '$cmdName'?" `
+                                    -Options @('Run once (type the values now)','Bulk - run for every row in a CSV file') -AllowBack
+                        try {
+                            if     ($mode -like 'Bulk*') { Invoke-BulkCmdlet  -Cmdlet $cmdName }
+                            elseif ($mode)               { Invoke-GuidedCmdlet -Cmdlet $cmdName }
+                        } catch { Write-Host ("Could not run '{0}': {1}" -f $cmdName, $_.Exception.Message) -ForegroundColor Red }
+                        Read-Host 'Press Enter to continue' | Out-Null
+                    }
+                    continue
+                }
+
+                $catActions = @($svcActions | Where-Object { $_.Category -eq $cat })
+                $label = Get-MenuChoice -Title "[$svcName / $cat] Choose an action" `
+                            -Options $catActions.Label `
+                            -Descriptions @($catActions | ForEach-Object { [string]$_.Help }) `
+                            -AllowBack
+                if (-not $label) { continue }
+
+                $action = $catActions | Where-Object { $_.Label -eq $label }
+                $mode = Get-MenuChoice -Title "How do you want to run '$($action.Label)'?" `
+                            -Options @('Run once (type the values now)','Bulk - run for every row in a CSV file') -AllowBack
+                if ($mode) {
+                    if ($mode -like 'Bulk*') {
+                        Invoke-BulkCmdlet  -Cmdlet $action.Cmdlet -Prompt $action.Prompt -ParamHelp $action.ParamHelp -Preset $action.Preset
+                    } else {
+                        Invoke-GuidedCmdlet -Cmdlet $action.Cmdlet -Prompt $action.Prompt -Help $action.Help -ParamHelp $action.ParamHelp -Preset $action.Preset
+                    }
+                    Read-Host 'Press Enter to continue' | Out-Null
+                }
+            }
+        }
+        Write-Host 'Goodbye.' -ForegroundColor Cyan
+    }
+    finally {
+        Stop-Transcript | Out-Null
+    }
+}
+
+Start-M365Toolkit
