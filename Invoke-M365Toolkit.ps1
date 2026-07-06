@@ -776,7 +776,20 @@ function Read-ParameterValue {
             continue
         }
         if ([string]::IsNullOrWhiteSpace($val)) { return $null }
-        if ($isArray) { return @($val -split '[,\s]+' | Where-Object { $_ }) }
+        if ($isArray) {
+            $vals = @($val -split '[,\s]+' | Where-Object { $_ })
+            if ($allowed) {
+                # -contains / -eq are case-insensitive for strings, so this catches
+                # typos like 'Send' (vs 'SendAs') and normalises casing to canonical.
+                $bad = @($vals | Where-Object { $allowed -notcontains $_ })
+                if ($bad.Count -gt 0) {
+                    Write-Host ("  Not valid: {0}. Choose from: {1}" -f ($bad -join ', '), ($allowed -join ', ')) -ForegroundColor Yellow
+                    continue
+                }
+                $vals = @($vals | ForEach-Object { $v = $_; $allowed | Where-Object { $_ -eq $v } | Select-Object -First 1 })
+            }
+            return $vals
+        }
         return $val
     }
 }
