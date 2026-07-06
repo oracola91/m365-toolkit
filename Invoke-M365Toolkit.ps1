@@ -45,7 +45,9 @@ $Services = @(
         Module      = 'ExchangeOnlineManagement'
         ConnectCmd  = 'Connect-ExchangeOnline'
         # Builds the parameter splat for the connect cmdlet from the entered email.
-        ConnectArgs = { param($Upn) @{ UserPrincipalName = $Upn; ShowBanner = $false } }
+        # LoadCmdletHelp so Get-Help works (EXO v3.7+ skips it by default) - lets
+        # the tool show real Microsoft parameter descriptions via '?'.
+        ConnectArgs = { param($Upn) @{ UserPrincipalName = $Upn; ShowBanner = $false; LoadCmdletHelp = $true } }
         Disconnect  = 'Disconnect-ExchangeOnline'
     }
     [pscustomobject]@{
@@ -276,6 +278,9 @@ $ParamDocs = @{
     Force           = 'Skip confirmation prompts and proceed.'
     ResultSize      = 'How many results to return (Unlimited for all).'
     WhatIf          = 'Show what WOULD happen without actually doing it.'
+    Deny            = 'Creates a DENY entry - blocks the right instead of granting it. Leave off for a normal grant.'
+    GroupMailbox    = 'Allow this to target a Microsoft 365 Group mailbox (normally blocked). Rarely needed.'
+    IgnoreDefaultScope = 'Search the whole tenant instead of the session''s default scope when resolving the mailbox. Advanced - only if a lookup fails due to scope.'
 }
 
 # ---------------------------------------------------------------------------
