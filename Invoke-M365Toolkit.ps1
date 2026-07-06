@@ -264,6 +264,21 @@ $ParamLookup = @{
 }
 
 # ---------------------------------------------------------------------------
+# Plain-language glossary for common parameters that actions don't describe
+# themselves - used by the '?' explain option in the optional/switch lists.
+# Keyed by parameter name. Add a row = teach the tool about a parameter.
+# ---------------------------------------------------------------------------
+$ParamDocs = @{
+    AutoMapping     = "Whether the mailbox auto-appears in the person's Outlook. Default `$true; set `$false for large/shared mailboxes so they add it manually."
+    InheritanceType = 'How the permission propagates on the AD object. Leave the default (All) - almost never changed.'
+    Identity        = 'The object the command acts on - a mailbox, user, or group (email address or name).'
+    Confirm         = 'Ask for confirmation before running.'
+    Force           = 'Skip confirmation prompts and proceed.'
+    ResultSize      = 'How many results to return (Unlimited for all).'
+    WhatIf          = 'Show what WOULD happen without actually doing it.'
+}
+
+# ---------------------------------------------------------------------------
 # Small UI helper: print a numbered menu and return the chosen item (or $null).
 # ---------------------------------------------------------------------------
 function Get-MenuChoice {
@@ -402,6 +417,25 @@ function Get-CmdletParameters {
 }
 
 # ---------------------------------------------------------------------------
+# Best plain-language description for a parameter, in order: the action's own
+# ParamHelp, the $ParamDocs glossary, then the cmdlet's built-in help. $null if
+# nothing is known. Used by the '?' explain option in the parameter lists.
+# ---------------------------------------------------------------------------
+function Get-ParamDescription {
+    param([string] $Name, [hashtable] $ParamHelp, [string] $Cmdlet)
+    if ($ParamHelp -and $ParamHelp[$Name]) { return $ParamHelp[$Name] }
+    if ($ParamDocs.ContainsKey($Name))     { return $ParamDocs[$Name] }
+    try {
+        $h = Get-Help $Cmdlet -Parameter $Name -ErrorAction SilentlyContinue
+        if ($h -and $h.description) {
+            $txt = ((($h.description | ForEach-Object { $_.Text }) -join ' ') -replace '\s+', ' ').Trim()
+            if ($txt) { return $txt }
+        }
+    } catch { }
+    return $null
+}
+
+# ---------------------------------------------------------------------------
 # Layer 2: the generic introspection engine. Given a cmdlet name it discovers
 # the real parameters, categorises them, prompts in plain language, previews,
 # and runs. Works for ANY cmdlet in ANY connected module - no per-cmdlet code.
@@ -447,13 +481,13 @@ function Invoke-GuidedCmdlet {
     } else { $required }
 
     foreach ($p in ($reqOrdered | Where-Object { $_ -and -not $bound.Contains($_.Name) })) {
-        $desc = if ($ParamHelp) { $ParamHelp[$p.Name] } else { $null }
+        $desc = Get-ParamDescription -Name $p.Name -ParamHelp $ParamHelp -Cmdlet $Cmdlet
         $bound[$p.Name] = Read-ParameterValue -Param $p -Required -Description $desc
     }
 
     # ---- Optional params named in the curated list: ask them outright.
     foreach ($p in ($optional | Where-Object { $promptList -contains $_.Name -and -not $bound.Contains($_.Name) })) {
-        $desc = if ($ParamHelp) { $ParamHelp[$p.Name] } else { $null }
+        $desc = Get-ParamDescription -Name $p.Name -ParamHelp $ParamHelp -Cmdlet $Cmdlet
         $v = Read-ParameterValue -Param $p -Description $desc
         if ($null -ne $v) { $bound[$p.Name] = $v }
     }
@@ -466,12 +500,22 @@ function Invoke-GuidedCmdlet {
         for ($i = 0; $i -lt $optRest.Count; $i++) {
             Write-Host ('  {0,2}. {1}  ({2})' -f ($i+1), $optRest[$i].Name, $optRest[$i].ParameterType.Name)
         }
-        $pick = Read-Host 'Enter numbers to set (comma-separated), or press Enter to skip'
+        Write-Host '   (type ? to explain each one)' -ForegroundColor DarkGray
+        $pick = $null
+        while ($true) {
+            $pick = Read-Host 'Enter numbers to set (comma-separated), ? to explain, or Enter to skip'
+            if ($pick -ne '?') { break }
+            for ($i = 0; $i -lt $optRest.Count; $i++) {
+                Write-Host ('  {0,2}. {1}' -f ($i+1), $optRest[$i].Name) -ForegroundColor White
+                $d = Get-ParamDescription -Name $optRest[$i].Name -ParamHelp $ParamHelp -Cmdlet $Cmdlet
+                if ($d) { Write-Host ('        {0}' -f $d) -ForegroundColor DarkGray } else { Write-Host '        (no description available)' -ForegroundColor DarkGray }
+            }
+        }
         foreach ($n in ($pick -split '[,\s]+' | Where-Object { $_ -match '^\d+$' })) {
             $idx = [int]$n - 1
             if ($idx -ge 0 -and $idx -lt $optRest.Count) {
                 $p = $optRest[$idx]
-                $desc = if ($ParamHelp) { $ParamHelp[$p.Name] } else { $null }
+                $desc = Get-ParamDescription -Name $p.Name -ParamHelp $ParamHelp -Cmdlet $Cmdlet
                 $bound[$p.Name] = Read-ParameterValue -Param $p -Description $desc
             }
         }
@@ -485,7 +529,17 @@ function Invoke-GuidedCmdlet {
         for ($i = 0; $i -lt $swRest.Count; $i++) {
             Write-Host ('  {0,2}. {1}' -f ($i+1), $swRest[$i].Name)
         }
-        $pick = Read-Host 'Enter numbers to enable (comma-separated), or press Enter to skip'
+        Write-Host '   (type ? to explain each one)' -ForegroundColor DarkGray
+        $pick = $null
+        while ($true) {
+            $pick = Read-Host 'Enter numbers to enable (comma-separated), ? to explain, or Enter to skip'
+            if ($pick -ne '?') { break }
+            for ($i = 0; $i -lt $swRest.Count; $i++) {
+                Write-Host ('  {0,2}. {1}' -f ($i+1), $swRest[$i].Name) -ForegroundColor White
+                $d = Get-ParamDescription -Name $swRest[$i].Name -ParamHelp $ParamHelp -Cmdlet $Cmdlet
+                if ($d) { Write-Host ('        {0}' -f $d) -ForegroundColor DarkGray } else { Write-Host '        (no description available)' -ForegroundColor DarkGray }
+            }
+        }
         foreach ($n in ($pick -split '[,\s]+' | Where-Object { $_ -match '^\d+$' })) {
             $idx = [int]$n - 1
             if ($idx -ge 0 -and $idx -lt $swRest.Count) { $bound[$swRest[$idx].Name] = $true }
