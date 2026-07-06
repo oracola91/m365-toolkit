@@ -135,12 +135,12 @@ $Actions = @(
     [pscustomobject]@{
         Service='Exchange Online'; Category='Mailbox access'
         Label='Let a user send AS another mailbox (Send As)'
-        Cmdlet='Add-RecipientPermission'; Prompt=@('Identity','Trustee','AccessRights')
+        Cmdlet='Add-RecipientPermission'; Prompt=@('Identity','Trustee')
+        Preset=@{ AccessRights='SendAs' }
         Help='Let a person send email that appears to come FROM another mailbox.'
         ParamHelp=@{
             Identity     = 'The mailbox that mail will appear to come FROM'
             Trustee      = 'The person who will be allowed to send as it'
-            AccessRights = 'Always SendAs for this action'
         }
     }
     [pscustomobject]@{
@@ -231,7 +231,7 @@ $Actions = @(
 # (case-insensitive). Teaching the tool a new field = adding one row.
 # ---------------------------------------------------------------------------
 $ParamHints = @{
-    AccessRights = @('FullAccess','SendAs','ExternalAccount','DeleteItem','ReadPermission','ChangePermission','ChangeOwner')
+    AccessRights = @('FullAccess','ExternalAccount','DeleteItem','ReadPermission','ChangePermission','ChangeOwner')
 }
 
 # ---------------------------------------------------------------------------
@@ -297,19 +297,19 @@ function Get-MenuChoice {
         [switch] $AllowBack
     )
     Write-Host ''
-    Write-Host $Title -ForegroundColor Cyan
+    Write-Host $Title -ForegroundColor White
     for ($i = 0; $i -lt $Options.Count; $i++) {
         Write-Host ('  {0,2}. {1}' -f ($i + 1), $Options[$i])
     }
-    if ($AllowBack) { Write-Host '   0. Back' -ForegroundColor DarkGray }
-    if ($Descriptions) { Write-Host '   (type ? for a short explanation of each choice)' -ForegroundColor DarkGray }
+    if ($AllowBack) { Write-Host '   0. Back' -ForegroundColor White }
+    if ($Descriptions) { Write-Host '   (type ? for a short explanation of each choice)' -ForegroundColor White }
     while ($true) {
         $raw = Read-Host 'Choose a number'
         if ($raw -eq '?' -and $Descriptions) {
             for ($i = 0; $i -lt $Options.Count; $i++) {
                 Write-Host ('  {0,2}. {1}' -f ($i + 1), $Options[$i]) -ForegroundColor White
                 $d = if ($i -lt $Descriptions.Count) { $Descriptions[$i] } else { '' }
-                if ($d) { Write-Host ('        {0}' -f $d) -ForegroundColor DarkGray }
+                if ($d) { Write-Host ('        {0}' -f $d) -ForegroundColor White }
             }
             continue
         }
@@ -339,7 +339,7 @@ function Connect-M365Service {
     }
     Import-Module $Service.Module -ErrorAction SilentlyContinue
     $connectArgs = & $Service.ConnectArgs $Upn
-    Write-Host ("Connecting to {0} as {1} ..." -f $Service.Name, $Upn) -ForegroundColor Cyan
+    Write-Host ("Connecting to {0} as {1} ..." -f $Service.Name, $Upn) -ForegroundColor White
     & $Service.ConnectCmd @connectArgs
     Write-Host ("Connected to {0}." -f $Service.Name) -ForegroundColor Green
 }
@@ -464,11 +464,11 @@ function Invoke-GuidedCmdlet {
     $optional = $parts.Optional
 
     Write-Host ''
-    Write-Host ("Building: {0}" -f $Cmdlet) -ForegroundColor Cyan
-    if ($Help) { Write-Host ("  {0}" -f $Help) -ForegroundColor Gray }
-    Write-Host ("  {0} required, {1} optional, {2} switches" -f $required.Count, $optional.Count, $switches.Count) -ForegroundColor DarkGray
+    Write-Host ("Building: {0}" -f $Cmdlet) -ForegroundColor White
+    if ($Help) { Write-Host ("  {0}" -f $Help) -ForegroundColor White }
+    Write-Host ("  {0} required, {1} optional, {2} switches" -f $required.Count, $optional.Count, $switches.Count) -ForegroundColor White
     if ($parts.SetName -and $parts.SetName -ne '__AllParameterSets') {
-        Write-Host ("  (using parameter set: {0})" -f $parts.SetName) -ForegroundColor DarkGray
+        Write-Host ("  (using parameter set: {0})" -f $parts.SetName) -ForegroundColor White
     }
 
     $bound = [ordered]@{}
@@ -478,7 +478,7 @@ function Invoke-GuidedCmdlet {
     #      preview, never prompted for.
     if ($Preset) {
         foreach ($k in $Preset.Keys) { $bound[$k] = $Preset[$k] }
-        Write-Host ('  Fixed by this action: ' + (($Preset.Keys | ForEach-Object { "-$_ $($Preset[$_])" }) -join ', ')) -ForegroundColor DarkGray
+        Write-Host ('  Fixed by this action: ' + (($Preset.Keys | ForEach-Object { "-$_ $($Preset[$_])" }) -join ', ')) -ForegroundColor White
     }
     $promptList = @($Prompt)   # params to always walk, even if optional
 
@@ -504,11 +504,11 @@ function Invoke-GuidedCmdlet {
     $optRest = @($optional | Where-Object { -not $bound.Contains($_.Name) })
     if ($optRest.Count -gt 0) {
         Write-Host ''
-        Write-Host 'Optional parameters you can set:' -ForegroundColor Cyan
+        Write-Host 'Optional parameters you can set:' -ForegroundColor White
         for ($i = 0; $i -lt $optRest.Count; $i++) {
             Write-Host ('  {0,2}. {1}  ({2})' -f ($i+1), $optRest[$i].Name, $optRest[$i].ParameterType.Name)
         }
-        Write-Host '   (type ? to explain each one)' -ForegroundColor DarkGray
+        Write-Host '   (type ? to explain each one)' -ForegroundColor White
         $pick = $null
         while ($true) {
             $pick = Read-Host 'Enter numbers to set (comma-separated), ? to explain, or Enter to skip'
@@ -516,7 +516,7 @@ function Invoke-GuidedCmdlet {
             for ($i = 0; $i -lt $optRest.Count; $i++) {
                 Write-Host ('  {0,2}. {1}' -f ($i+1), $optRest[$i].Name) -ForegroundColor White
                 $d = Get-ParamDescription -Name $optRest[$i].Name -ParamHelp $ParamHelp -Cmdlet $Cmdlet
-                if ($d) { Write-Host ('        {0}' -f $d) -ForegroundColor DarkGray } else { Write-Host '        (no description available)' -ForegroundColor DarkGray }
+                if ($d) { Write-Host ('        {0}' -f $d) -ForegroundColor White } else { Write-Host '        (no description available)' -ForegroundColor White }
             }
         }
         foreach ($n in ($pick -split '[,\s]+' | Where-Object { $_ -match '^\d+$' })) {
@@ -533,11 +533,11 @@ function Invoke-GuidedCmdlet {
     $swRest = @($switches | Where-Object { -not $bound.Contains($_.Name) })
     if ($swRest.Count -gt 0) {
         Write-Host ''
-        Write-Host 'Switches you can enable:' -ForegroundColor Cyan
+        Write-Host 'Switches you can enable:' -ForegroundColor White
         for ($i = 0; $i -lt $swRest.Count; $i++) {
             Write-Host ('  {0,2}. {1}' -f ($i+1), $swRest[$i].Name)
         }
-        Write-Host '   (type ? to explain each one)' -ForegroundColor DarkGray
+        Write-Host '   (type ? to explain each one)' -ForegroundColor White
         $pick = $null
         while ($true) {
             $pick = Read-Host 'Enter numbers to enable (comma-separated), ? to explain, or Enter to skip'
@@ -545,7 +545,7 @@ function Invoke-GuidedCmdlet {
             for ($i = 0; $i -lt $swRest.Count; $i++) {
                 Write-Host ('  {0,2}. {1}' -f ($i+1), $swRest[$i].Name) -ForegroundColor White
                 $d = Get-ParamDescription -Name $swRest[$i].Name -ParamHelp $ParamHelp -Cmdlet $Cmdlet
-                if ($d) { Write-Host ('        {0}' -f $d) -ForegroundColor DarkGray } else { Write-Host '        (no description available)' -ForegroundColor DarkGray }
+                if ($d) { Write-Host ('        {0}' -f $d) -ForegroundColor White } else { Write-Host '        (no description available)' -ForegroundColor White }
             }
         }
         foreach ($n in ($pick -split '[,\s]+' | Where-Object { $_ -match '^\d+$' })) {
@@ -561,7 +561,7 @@ function Invoke-GuidedCmdlet {
     Write-Host ('  ' + $preview) -ForegroundColor White
 
     if ($DryRunOnly) {
-        Write-Host 'DryRunOnly is set - not executing.' -ForegroundColor DarkGray
+        Write-Host 'DryRunOnly is set - not executing.' -ForegroundColor White
         return
     }
 
@@ -570,11 +570,11 @@ function Invoke-GuidedCmdlet {
     Write-Host 'FINAL CONFIRMATION - about to execute this command:' -ForegroundColor Yellow
     Write-Host ('  ' + $preview) -ForegroundColor White
     if ((Read-Host 'Execute it now? (y/n)') -notmatch '^(y|yes)$') {
-        Write-Host 'Cancelled - nothing was run.' -ForegroundColor DarkGray
+        Write-Host 'Cancelled - nothing was run.' -ForegroundColor White
         return
     }
 
-    Write-Host 'Running...' -ForegroundColor Cyan
+    Write-Host 'Running...' -ForegroundColor White
     $result = & $Cmdlet @bound
     Write-Host 'Done.' -ForegroundColor Green
     Show-Result -Result $result -Cmdlet $Cmdlet
@@ -602,8 +602,8 @@ function Invoke-BulkCmdlet {
     $columns = @($rows[0].PSObject.Properties.Name)
 
     Write-Host ''
-    Write-Host ("Loaded {0} rows. Columns: {1}" -f $rows.Count, ($columns -join ', ')) -ForegroundColor Cyan
-    Write-Host 'For each parameter: type a COLUMN name (uses each row''s value), or =value for a fixed value on every row, or press Enter to skip.' -ForegroundColor DarkGray
+    Write-Host ("Loaded {0} rows. Columns: {1}" -f $rows.Count, ($columns -join ', ')) -ForegroundColor White
+    Write-Host 'For each parameter: type a COLUMN name (uses each row''s value), or =value for a fixed value on every row, or press Enter to skip.' -ForegroundColor White
 
     # map: paramName -> @{ Kind = 'column' | 'fixed' | 'switch'; Value = ... }
     $map = [ordered]@{}
@@ -613,7 +613,7 @@ function Invoke-BulkCmdlet {
         param($p, $required)
         if ($map.Contains($p.Name)) { return }
         $desc = if ($ParamHelp) { $ParamHelp[$p.Name] } else { $null }
-        if ($desc) { Write-Host ("  -> {0}" -f $desc) -ForegroundColor Gray }
+        if ($desc) { Write-Host ("  -> {0}" -f $desc) -ForegroundColor White }
         while ($true) {
             $ans = Read-Host ("Map -{0} (column / =fixed / Enter){1}" -f $p.Name, $(if ($required) { ' [required]' } else { '' }))
             if ([string]::IsNullOrWhiteSpace($ans)) {
@@ -637,7 +637,7 @@ function Invoke-BulkCmdlet {
     $optRest = @($parts.Optional | Where-Object { -not $map.Contains($_.Name) })
     if ($optRest.Count -gt 0) {
         Write-Host ''
-        Write-Host 'Optional parameters you can map:' -ForegroundColor Cyan
+        Write-Host 'Optional parameters you can map:' -ForegroundColor White
         for ($i=0; $i -lt $optRest.Count; $i++) { Write-Host ('  {0,2}. {1}' -f ($i+1), $optRest[$i].Name) }
         $pick = Read-Host 'Enter numbers to map (comma-separated), or Enter to skip'
         foreach ($n in ($pick -split '[,\s]+' | Where-Object { $_ -match '^\d+$' })) {
@@ -649,7 +649,7 @@ function Invoke-BulkCmdlet {
     $swRest = @($parts.Switches | Where-Object { -not $map.Contains($_.Name) })
     if ($swRest.Count -gt 0) {
         Write-Host ''
-        Write-Host 'Switches to enable for every row:' -ForegroundColor Cyan
+        Write-Host 'Switches to enable for every row:' -ForegroundColor White
         for ($i=0; $i -lt $swRest.Count; $i++) { Write-Host ('  {0,2}. {1}' -f ($i+1), $swRest[$i].Name) }
         $pick = Read-Host 'Enter numbers to enable, or Enter to skip'
         foreach ($n in ($pick -split '[,\s]+' | Where-Object { $_ -match '^\d+$' })) {
@@ -676,14 +676,14 @@ function Invoke-BulkCmdlet {
     Write-Host ('Preview - first of {0} rows (dry-run):' -f $rows.Count) -ForegroundColor Yellow
     Write-Host ('  ' + $preview) -ForegroundColor White
 
-    if ($DryRunOnly) { Write-Host 'DryRunOnly is set - not executing.' -ForegroundColor DarkGray; return }
+    if ($DryRunOnly) { Write-Host 'DryRunOnly is set - not executing.' -ForegroundColor White; return }
 
     # Last confirmation before running every row.
     Write-Host ''
     Write-Host ('FINAL CONFIRMATION - about to run this for ALL {0} rows, e.g.:' -f $rows.Count) -ForegroundColor Yellow
     Write-Host ('  ' + $preview) -ForegroundColor White
     if ((Read-Host ("Execute for all {0} rows now? (y/n)" -f $rows.Count)) -notmatch '^(y|yes)$') {
-        Write-Host 'Cancelled - nothing was run.' -ForegroundColor DarkGray; return
+        Write-Host 'Cancelled - nothing was run.' -ForegroundColor White; return
     }
 
     $ok=0; $fail=0; $i=0
@@ -698,7 +698,7 @@ function Invoke-BulkCmdlet {
         }
     }
     Write-Host ''
-    Write-Host ("Bulk done: {0} succeeded, {1} failed, {2} total." -f $ok, $fail, $rows.Count) -ForegroundColor Cyan
+    Write-Host ("Bulk done: {0} succeeded, {1} failed, {2} total." -f $ok, $fail, $rows.Count) -ForegroundColor White
 }
 
 # ---------------------------------------------------------------------------
@@ -726,7 +726,7 @@ function Read-ParameterValue {
     elseif ($ParamHints.ContainsKey($name)) { $allowed = [string[]]$ParamHints[$name] }
 
     # Say what the field means before asking for it.
-    if ($Description) { Write-Host ("  -> {0}" -f $Description) -ForegroundColor Gray }
+    if ($Description) { Write-Host ("  -> {0}" -f $Description) -ForegroundColor White }
 
     # Single-value field with a fixed set -> numbered pick menu.
     if ($allowed -and -not $isArray) {
@@ -760,10 +760,10 @@ function Read-ParameterValue {
         # Normalise for keyword detection (trim + lower-case) so 'Find', ' find ' etc. still work.
         $key = ("$val").Trim().ToLower()
         if ($key -eq '?') {
-            if ($Description) { Write-Host ('  {0}' -f $Description) -ForegroundColor Gray }
-            if     ($allowed) { Write-Host ('  Options: ' + ($allowed -join ', ')) -ForegroundColor Cyan }
-            elseif ($canFind) { Write-Host "  Enter an email address or name - or type 'find' to search the directory." -ForegroundColor Cyan }
-            else              { Write-Host '  Free text - type a value.' -ForegroundColor DarkGray }
+            if ($Description) { Write-Host ('  {0}' -f $Description) -ForegroundColor White }
+            if     ($allowed) { Write-Host ('  Options: ' + ($allowed -join ', ')) -ForegroundColor White }
+            elseif ($canFind) { Write-Host "  Enter an email address or name - or type 'find' to search the directory." -ForegroundColor White }
+            else              { Write-Host '  Free text - type a value.' -ForegroundColor White }
             continue
         }
         if ($key -eq 'find' -and $canFind) {
@@ -775,7 +775,7 @@ function Read-ParameterValue {
             $pick = Get-MenuChoice -Title '  Pick one:' -Options @($hits.Display) -AllowBack
             if (-not $pick) { continue }
             $sel = $hits | Where-Object { $_.Display -eq $pick } | Select-Object -First 1
-            Write-Host ('  -> using {0}' -f $sel.Value) -ForegroundColor DarkGray
+            Write-Host ('  -> using {0}' -f $sel.Value) -ForegroundColor White
             return $sel.Value
         }
         if ([string]::IsNullOrWhiteSpace($val) -and $Required) {
@@ -818,7 +818,7 @@ function Select-ResultColumns {
     param([Parameter(Mandatory)] $Items)
     $cols = @($Items[0].PSObject.Properties.Name)
     Write-Host ''
-    Write-Host 'Available columns:' -ForegroundColor Cyan
+    Write-Host 'Available columns:' -ForegroundColor White
     for ($i=0; $i -lt $cols.Count; $i++) { Write-Host ('  {0,2}. {1}' -f ($i+1), $cols[$i]) }
     $pick = Read-Host 'Enter column numbers (comma-separated), or Enter for all'
     $nums = @($pick -split '[,\s]+' | Where-Object { $_ -match '^\d+$' })
@@ -850,8 +850,8 @@ function Show-Result {
     param($Result, [string] $Cmdlet)
 
     $items = @($Result)
-    if ($items.Count -eq 0) { Write-Host 'No objects returned.' -ForegroundColor DarkGray; return }
-    Write-Host ("Returned {0} item(s)." -f $items.Count) -ForegroundColor Cyan
+    if ($items.Count -eq 0) { Write-Host 'No objects returned.' -ForegroundColor White; return }
+    Write-Host ("Returned {0} item(s)." -f $items.Count) -ForegroundColor White
 
     # Only offer table/CSV handling for real objects; scalars/strings just print.
     $first = $items[0]
@@ -906,12 +906,12 @@ function Show-WhoAmI {
     try {
         if ($Service.Module -eq 'ExchangeOnlineManagement') {
             $ci = Get-ConnectionInformation -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($ci) { Write-Host ("  Org: {0}  |  UPN: {1}" -f $ci.Organization, $ci.UserPrincipalName) -ForegroundColor DarkGray }
+            if ($ci) { Write-Host ("  Org: {0}  |  UPN: {1}" -f $ci.Organization, $ci.UserPrincipalName) -ForegroundColor White }
         } elseif ($Service.Module -like 'Microsoft.Graph*') {
             $ctx = Get-MgContext -ErrorAction SilentlyContinue
             if ($ctx) {
-                Write-Host ("  Account: {0}" -f $ctx.Account) -ForegroundColor DarkGray
-                Write-Host ("  Granted scopes: {0}" -f ($ctx.Scopes -join ', ')) -ForegroundColor DarkGray
+                Write-Host ("  Account: {0}" -f $ctx.Account) -ForegroundColor White
+                Write-Host ("  Granted scopes: {0}" -f ($ctx.Scopes -join ', ')) -ForegroundColor White
             }
         }
     } catch { }
@@ -958,9 +958,9 @@ function Start-M365Toolkit {
     $logFile = Join-Path $logDir "session-$stamp.log"
     Start-Transcript -Path $logFile -Append | Out-Null
     try {
-        Write-Host '=====================================================' -ForegroundColor Cyan
-        Write-Host '  Microsoft 365 Guided Command Builder  (v0.5)'        -ForegroundColor Cyan
-        Write-Host '=====================================================' -ForegroundColor Cyan
+        Write-Host '=====================================================' -ForegroundColor White
+        Write-Host '  Microsoft 365 Guided Command Builder  (v0.5)'        -ForegroundColor White
+        Write-Host '=====================================================' -ForegroundColor White
 
         $cfg = Get-ToolkitConfig
         $upnPrompt = if ($cfg.Upn) { "Your email (UPN) [Enter = $($cfg.Upn)]" } else { 'Your email (UPN)' }
@@ -991,7 +991,7 @@ function Start-M365Toolkit {
                 $svcActions = $Actions | Where-Object { $_.Service -eq $svcName }
                 if (-not $svcActions) {
                     Write-Host 'No plain-language actions catalogued for this service yet.' -ForegroundColor Yellow
-                    Write-Host '(You can still extend $Actions - or point the engine at any cmdlet.)' -ForegroundColor DarkGray
+                    Write-Host '(You can still extend $Actions - or point the engine at any cmdlet.)' -ForegroundColor White
                 }
 
                 $categories = @($svcActions.Category | Select-Object -Unique)
@@ -1051,7 +1051,7 @@ function Start-M365Toolkit {
             }
             if ($quit) { break }
         }
-        Write-Host 'Goodbye.' -ForegroundColor Cyan
+        Write-Host 'Goodbye.' -ForegroundColor White
     }
     finally {
         Stop-Transcript | Out-Null
