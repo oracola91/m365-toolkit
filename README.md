@@ -38,6 +38,24 @@ cd M365Toolkit
 .\Invoke-M365Toolkit.ps1
 ```
 
+### Run it remotely (once the repo is public)
+
+No local copy needed — open PowerShell and run one line:
+
+```powershell
+irm https://raw.githubusercontent.com/oracola91/m365-toolkit/main/Invoke-M365Toolkit.ps1 | iex
+```
+
+For the safe dry-run preview mode over the network:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/oracola91/m365-toolkit/main/Invoke-M365Toolkit.ps1))) -DryRunOnly
+```
+
+Run this way there is no local file, so logs and CSV exports go to `%USERPROFILE%\M365Toolkit\`.
+The raw URL is CDN-cached for a few minutes, so a fresh push isn't instantly live. (The repo is
+private for now — this works once it's switched to public.)
+
 If a required module isn't installed, the tool offers to install it for the current user.
 
 - Uses **your signed-in admin's RBAC role** — a helpdesk member can only do what their
