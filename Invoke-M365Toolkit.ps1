@@ -760,8 +760,10 @@ function Read-ParameterValue {
         # Normalise for keyword detection (trim + lower-case) so 'Find', ' find ' etc. still work.
         $key = ("$val").Trim().ToLower()
         if ($key -eq '?') {
-            if ($allowed) { Write-Host ('  Options: ' + ($allowed -join ', ')) -ForegroundColor Cyan }
-            else          { Write-Host '  No fixed list for this one - free text.' -ForegroundColor DarkGray }
+            if ($Description) { Write-Host ('  {0}' -f $Description) -ForegroundColor Gray }
+            if     ($allowed) { Write-Host ('  Options: ' + ($allowed -join ', ')) -ForegroundColor Cyan }
+            elseif ($canFind) { Write-Host "  Enter an email address or name - or type 'find' to search the directory." -ForegroundColor Cyan }
+            else              { Write-Host '  Free text - type a value.' -ForegroundColor DarkGray }
             continue
         }
         if ($key -eq 'find' -and $canFind) {
@@ -787,8 +789,8 @@ function Read-ParameterValue {
             $match = $null
             try { $match = & $lookup.Resolve $val } catch { }
             if (-not $match) {
-                Write-Host ("  No mailbox/user found matching '{0}'. Type 'find' to search, or re-enter." -f $val) -ForegroundColor Yellow
-                if ((Read-Host '  Use it anyway? (y/n)') -notmatch '^(y|yes)$') { continue }
+                Write-Host ("  No mailbox/user found matching '{0}'. Check the spelling, or type 'find' to search." -f $val) -ForegroundColor Yellow
+                continue
             }
         }
         if ($isArray) {
