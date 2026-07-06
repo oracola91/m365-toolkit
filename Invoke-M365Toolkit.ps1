@@ -174,6 +174,14 @@ $Actions = @(
     }
     [pscustomobject]@{
         Service='Exchange Online'; Category='Shared mailboxes'
+        Label='Convert a shared mailbox back to a regular (user) mailbox'
+        Cmdlet='Set-Mailbox'; Prompt=@('Identity')
+        Preset=@{ Type='Regular' }
+        Help='Turn a shared mailbox back into a normal user mailbox. NOTE: a regular mailbox needs an Exchange Online license assigned, or it gets disabled after ~30 days.'
+        ParamHelp=@{ Identity='The shared mailbox to convert back (email address or name)' }
+    }
+    [pscustomobject]@{
+        Service='Exchange Online'; Category='Shared mailboxes'
         Label='Give Full Access to a shared mailbox (set auto-mapping)'
         Cmdlet='Add-MailboxPermission'; Prompt=@('Identity','User','AutoMapping')
         Preset=@{ AccessRights='FullAccess' }
