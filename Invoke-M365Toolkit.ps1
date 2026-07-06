@@ -353,13 +353,48 @@ function Format-CommandPreview {
 # both the guided (one-at-a-time) and bulk (CSV) runners so they stay in sync.
 # ---------------------------------------------------------------------------
 function Get-CmdletParameters {
-    param([Parameter(Mandatory)] $Cmd)
+    param(
+        [Parameter(Mandatory)] $Cmd,
+        [string[]] $PreferParams   # hint: params the action intends to use, to pick the right set
+    )
     $common = [System.Management.Automation.PSCmdlet]::CommonParameters +
               [System.Management.Automation.PSCmdlet]::OptionalCommonParameters
     $all = $Cmd.Parameters.Values | Where-Object { $common -notcontains $_.Name }
-    $isMandatory = { param($p) ($p.Attributes | Where-Object {
-        $_ -is [System.Management.Automation.ParameterAttribute] -and $_.Mandatory }) -ne $null }
+
+    # Many cmdlets have several mutually-exclusive PARAMETER SETS (e.g.
+    # Add-MailboxPermission has an AccessRights set AND an Owner set). A param
+    # that is mandatory in one set is optional/absent in another, so we must
+    # resolve ONE set and classify against it - otherwise unrelated params
+    # (like -Owner) wrongly show as required. Pick the set that best matches the
+    # action's intended params, else the cmdlet's default set.
+    $setNames = @($Cmd.ParameterSets | ForEach-Object { $_.Name })
+    $chosen = if ($setNames.Count -le 1) { $setNames | Select-Object -First 1 } else {
+        $best = $null
+        if ($PreferParams) {
+            $best = ($Cmd.ParameterSets | Sort-Object `
+                @{ Expression = { @($_.Parameters | Where-Object { $PreferParams -contains $_.Name }).Count }; Descending = $true }, `
+                @{ Expression = { [int]$_.IsDefault }; Descending = $true } | Select-Object -First 1).Name
+        }
+        if (-not $best) { $best = ($Cmd.ParameterSets | Where-Object { $_.IsDefault } | Select-Object -First 1).Name }
+        if (-not $best) { $best = $setNames[0] }
+        $best
+    }
+
+    # Keep only params that belong to the chosen set (or to all sets).
+    if ($chosen) {
+        $all = $all | Where-Object { $_.ParameterSets.ContainsKey($chosen) -or $_.ParameterSets.ContainsKey('__AllParameterSets') }
+    }
+
+    # Mandatory-ness is per-set: read the chosen set's entry (or the all-sets entry).
+    $isMandatory = {
+        param($p)
+        if     ($chosen -and $p.ParameterSets.ContainsKey($chosen))     { return $p.ParameterSets[$chosen].IsMandatory }
+        elseif ($p.ParameterSets.ContainsKey('__AllParameterSets'))     { return $p.ParameterSets['__AllParameterSets'].IsMandatory }
+        return (@($p.ParameterSets.Values | Where-Object { $_.IsMandatory }).Count -gt 0)
+    }
+
     [pscustomobject]@{
+        SetName  = $chosen
         Required = @($all | Where-Object { & $isMandatory $_ })
         Switches = @($all | Where-Object { -not (& $isMandatory $_) -and $_.SwitchParameter })
         Optional = @($all | Where-Object { -not (& $isMandatory $_) -and -not $_.SwitchParameter })
@@ -381,7 +416,7 @@ function Invoke-GuidedCmdlet {
     )
 
     $cmd      = Get-Command $Cmdlet -ErrorAction Stop
-    $parts    = Get-CmdletParameters -Cmd $cmd
+    $parts    = Get-CmdletParameters -Cmd $cmd -PreferParams $Prompt
     $required = $parts.Required
     $switches = $parts.Switches
     $optional = $parts.Optional
@@ -390,6 +425,9 @@ function Invoke-GuidedCmdlet {
     Write-Host ("Building: {0}" -f $Cmdlet) -ForegroundColor Cyan
     if ($Help) { Write-Host ("  {0}" -f $Help) -ForegroundColor Gray }
     Write-Host ("  {0} required, {1} optional, {2} switches" -f $required.Count, $optional.Count, $switches.Count) -ForegroundColor DarkGray
+    if ($parts.SetName -and $parts.SetName -ne '__AllParameterSets') {
+        Write-Host ("  (using parameter set: {0})" -f $parts.SetName) -ForegroundColor DarkGray
+    }
 
     $bound = [ordered]@{}
 
@@ -493,7 +531,7 @@ function Invoke-BulkCmdlet {
         [hashtable] $Preset
     )
     $cmd   = Get-Command $Cmdlet -ErrorAction Stop
-    $parts = Get-CmdletParameters -Cmd $cmd
+    $parts = Get-CmdletParameters -Cmd $cmd -PreferParams $Prompt
 
     $csvPath = (Read-Host 'Path to CSV file (must have a header row)').Trim('"',' ')
     if (-not (Test-Path $csvPath)) { Write-Host "File not found: $csvPath" -ForegroundColor Red; return }
