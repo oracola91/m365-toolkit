@@ -248,6 +248,8 @@ $recipientLookup = @{
         Get-EXORecipient -ResultSize 25 -Filter "DisplayName -like '*$term*' -or PrimarySmtpAddress -like '*$term*'" -ErrorAction Stop |
             ForEach-Object { [pscustomobject]@{ Display = ('{0}  <{1}>  [{2}]' -f $_.DisplayName, $_.PrimarySmtpAddress, $_.RecipientTypeDetails); Value = [string]$_.PrimarySmtpAddress } }
     }
+    # Resolve an EXACT typed value to a real recipient (or $null if it doesn't exist).
+    Resolve = { param($v) Get-EXORecipient -Identity $v -ErrorAction SilentlyContinue | Select-Object -First 1 }
 }
 $ParamLookup = @{
     Identity = $recipientLookup
@@ -262,6 +264,7 @@ $ParamLookup = @{
             Get-MgUser -Filter "startswith(displayName,'$term') or startswith(mail,'$term') or startswith(userPrincipalName,'$term')" -Top 25 -ErrorAction Stop |
                 ForEach-Object { [pscustomobject]@{ Display = ('{0}  <{1}>' -f $_.DisplayName, $_.UserPrincipalName); Value = [string]$_.UserPrincipalName } }
         }
+        Resolve = { param($v) Get-MgUser -UserId $v -ErrorAction SilentlyContinue }
     }
 }
 
@@ -754,15 +757,14 @@ function Read-ParameterValue {
 
     while ($true) {
         $val = Read-Host $label
-        # Normalise for keyword detection: trim, lower-case, and accept the
-        # Cyrillic 'финд' too (Bulgarian keyboard layout types that for 'find').
+        # Normalise for keyword detection (trim + lower-case) so 'Find', ' find ' etc. still work.
         $key = ("$val").Trim().ToLower()
         if ($key -eq '?') {
             if ($allowed) { Write-Host ('  Options: ' + ($allowed -join ', ')) -ForegroundColor Cyan }
             else          { Write-Host '  No fixed list for this one - free text.' -ForegroundColor DarkGray }
             continue
         }
-        if (($key -eq 'find' -or $key -eq 'финд') -and $canFind) {
+        if ($key -eq 'find' -and $canFind) {
             $term = Read-Host '  Search text (name or email)'
             if ([string]::IsNullOrWhiteSpace($term)) { continue }
             try { $hits = @(& $lookup.Run $term) }
@@ -779,6 +781,16 @@ function Read-ParameterValue {
             continue
         }
         if ([string]::IsNullOrWhiteSpace($val)) { return $null }
+        # Identity-style fields: verify the typed value is a real recipient/user.
+        # Catches nonsense/typos instead of silently accepting them as an address.
+        if ($canFind -and $lookup.Resolve -and -not $isArray) {
+            $match = $null
+            try { $match = & $lookup.Resolve $val } catch { }
+            if (-not $match) {
+                Write-Host ("  No mailbox/user found matching '{0}'. Type 'find' to search, or re-enter." -f $val) -ForegroundColor Yellow
+                if ((Read-Host '  Use it anyway? (y/n)') -notmatch '^(y|yes)$') { continue }
+            }
+        }
         if ($isArray) {
             $vals = @($val -split '[,\s]+' | Where-Object { $_ })
             if ($allowed) {
