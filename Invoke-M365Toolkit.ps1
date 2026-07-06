@@ -754,12 +754,15 @@ function Read-ParameterValue {
 
     while ($true) {
         $val = Read-Host $label
-        if ($val -eq '?') {
+        # Normalise for keyword detection: trim, lower-case, and accept the
+        # Cyrillic 'финд' too (Bulgarian keyboard layout types that for 'find').
+        $key = ("$val").Trim().ToLower()
+        if ($key -eq '?') {
             if ($allowed) { Write-Host ('  Options: ' + ($allowed -join ', ')) -ForegroundColor Cyan }
             else          { Write-Host '  No fixed list for this one - free text.' -ForegroundColor DarkGray }
             continue
         }
-        if ($val -eq 'find' -and $canFind) {
+        if (($key -eq 'find' -or $key -eq 'финд') -and $canFind) {
             $term = Read-Host '  Search text (name or email)'
             if ([string]::IsNullOrWhiteSpace($term)) { continue }
             try { $hits = @(& $lookup.Run $term) }
