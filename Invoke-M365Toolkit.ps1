@@ -575,9 +575,13 @@ function Invoke-GuidedCmdlet {
     }
 
     Write-Host 'Running...' -ForegroundColor White
-    $result = & $Cmdlet @bound
-    Write-Host 'Done.' -ForegroundColor Green
-    Show-Result -Result $result -Cmdlet $Cmdlet
+    try {
+        $result = & $Cmdlet @bound -ErrorAction Stop
+        Write-Host 'Done.' -ForegroundColor Green
+        Show-Result -Result $result -Cmdlet $Cmdlet
+    } catch {
+        Write-Host ('Failed: {0}' -f $_.Exception.Message) -ForegroundColor Red
+    }
 }
 
 # ---------------------------------------------------------------------------
