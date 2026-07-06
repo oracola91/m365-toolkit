@@ -144,6 +144,20 @@ $Actions = @(
         }
     }
     [pscustomobject]@{
+        Service='Exchange Online'; Category='Mailbox access'
+        Label='See who can Send As a mailbox'
+        Cmdlet='Get-RecipientPermission'; Prompt=@('Identity')
+        Help='List everyone who has Send As on a mailbox - use it to verify a Send As grant.'
+        ParamHelp=@{ Identity='The mailbox to check - the one others may send email AS' }
+    }
+    [pscustomobject]@{
+        Service='Exchange Online'; Category='Mailbox access'
+        Label='See who has access to a mailbox (FullAccess etc.)'
+        Cmdlet='Get-MailboxPermission'; Prompt=@('Identity')
+        Help='List who can open/manage a mailbox. NOTE: "NT AUTHORITY\SELF" and inherited rows are normal system entries - the real grants are the named users.'
+        ParamHelp=@{ Identity='The mailbox to check - whose access list you want to see' }
+    }
+    [pscustomobject]@{
         Service='Exchange Online'; Category='Mailboxes'; Label='Look up a mailbox'
         Cmdlet='Get-EXOMailbox'; Prompt=@('Identity')
         Help='Show details about a mailbox.'
@@ -488,15 +502,32 @@ function Invoke-GuidedCmdlet {
         @($required | Where-Object { $Prompt -notcontains $_.Name })
     } else { $required }
 
-    foreach ($p in ($reqOrdered | Where-Object { $_ -and -not $bound.Contains($_.Name) })) {
+    # Required params: prompt in curated order. Typing 'back' steps to the
+    # PREVIOUS field (discarding its value so it can be re-entered); 'back' on
+    # the first field cancels the action and returns to the menu.
+    $reqList = @($reqOrdered | Where-Object { $_ -and -not $bound.Contains($_.Name) })
+    $ri = 0
+    while ($ri -lt $reqList.Count) {
+        $p = $reqList[$ri]
         $desc = Get-ParamDescription -Name $p.Name -ParamHelp $ParamHelp -Cmdlet $Cmdlet
-        $bound[$p.Name] = Read-ParameterValue -Param $p -Required -Description $desc
+        $val = Read-ParameterValue -Param $p -Required -Description $desc
+        if ($script:ParamCancel) { Write-Host 'Cancelled - back to the menu (nothing was run).' -ForegroundColor White; return }
+        if ($script:ParamBack) {
+            if ($ri -eq 0) { Write-Host "  Already at the first field - type 'cancel' to return to the menu." -ForegroundColor White; continue }
+            $ri--
+            $bound.Remove($reqList[$ri].Name)
+            Write-Host ("  Going back to -{0}." -f $reqList[$ri].Name) -ForegroundColor White
+            continue
+        }
+        $bound[$p.Name] = $val
+        $ri++
     }
 
     # ---- Optional params named in the curated list: ask them outright.
     foreach ($p in ($optional | Where-Object { $promptList -contains $_.Name -and -not $bound.Contains($_.Name) })) {
         $desc = Get-ParamDescription -Name $p.Name -ParamHelp $ParamHelp -Cmdlet $Cmdlet
         $v = Read-ParameterValue -Param $p -Description $desc
+        if ($script:ParamBack -or $script:ParamCancel) { Write-Host 'Cancelled - back to the menu (nothing was run).' -ForegroundColor White; return }
         if ($null -ne $v) { $bound[$p.Name] = $v }
     }
 
@@ -525,6 +556,7 @@ function Invoke-GuidedCmdlet {
                 $p = $optRest[$idx]
                 $desc = Get-ParamDescription -Name $p.Name -ParamHelp $ParamHelp -Cmdlet $Cmdlet
                 $bound[$p.Name] = Read-ParameterValue -Param $p -Description $desc
+                if ($script:ParamBack -or $script:ParamCancel) { Write-Host 'Cancelled - back to the menu (nothing was run).' -ForegroundColor White; return }
             }
         }
     }
@@ -706,6 +738,50 @@ function Invoke-BulkCmdlet {
 }
 
 # ---------------------------------------------------------------------------
+# Numbered picker for a fixed set of allowed values. -Multi lets the user pick
+# several (comma-separated); otherwise one. Typing 'back' / 0 sets ParamBack,
+# 'cancel' sets ParamCancel (the caller decides what those mean). Returns the
+# chosen value (string) or values (string[]), or $null when the user backs out.
+# ---------------------------------------------------------------------------
+function Read-OptionMenu {
+    param(
+        [Parameter(Mandatory)] [string]   $Name,
+        [Parameter(Mandatory)] [string[]] $Options,
+        [switch] $Multi,
+        [string] $Description
+    )
+    Write-Host ''
+    Write-Host (('Choose {0} for -{1}:' -f $(if ($Multi) { 'one or more' } else { 'a value' }), $Name)) -ForegroundColor White
+    for ($i = 0; $i -lt $Options.Count; $i++) { Write-Host ('  {0,2}. {1}' -f ($i + 1), $Options[$i]) }
+    Write-Host "   0. Back to previous field   (or type 'cancel' to quit to the menu)" -ForegroundColor White
+    $hintNums = if ($Multi) { 'numbers (e.g. 1,3)' } else { 'a number' }
+    while ($true) {
+        $pick = Read-Host ('Enter {0}, 0 to go back, or ? to explain' -f $hintNums)
+        $k = ("$pick").Trim().ToLower()
+        if ($k -eq '?') {
+            if ($Description) { Write-Host ('  {0}' -f $Description) -ForegroundColor White }
+            Write-Host ('  Options: ' + ($Options -join ', ')) -ForegroundColor White
+            continue
+        }
+        if ($k -eq 'back' -or $k -eq '0') { $script:ParamBack   = $true; return $null }
+        if ($k -eq 'cancel')              { $script:ParamCancel = $true; return $null }
+        $nums = @($k -split '[,\s]+' | Where-Object { $_ -match '^\d+$' })
+        if ($nums.Count -eq 0) { Write-Host ('  Type {0} from the list.' -f $hintNums) -ForegroundColor Yellow; continue }
+        if (-not $Multi -and $nums.Count -gt 1) { Write-Host '  Just one number for this field.' -ForegroundColor Yellow; continue }
+        $sel = @(); $bad = $false
+        foreach ($n in $nums) {
+            $idx = [int]$n - 1
+            if ($idx -ge 0 -and $idx -lt $Options.Count) { $sel += $Options[$idx] }
+            else { Write-Host ('  {0} is not in the list (1-{1}).' -f $n, $Options.Count) -ForegroundColor Yellow; $bad = $true; break }
+        }
+        if ($bad) { continue }
+        $sel = @($sel | Select-Object -Unique)
+        Write-Host ('  -> ' + ($sel -join ', ')) -ForegroundColor White
+        if ($Multi) { return $sel } else { return $sel[0] }
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Prompt for a single parameter value, in plain language. ValidateSet params
 # are offered as a numbered pick; everything else gets a friendly type hint.
 # ---------------------------------------------------------------------------
@@ -715,6 +791,8 @@ function Read-ParameterValue {
         [switch] $Required,
         [string] $Description   # plain-language "what is this field?" shown above the prompt
     )
+    $script:ParamBack   = $false  # cleared each prompt; set if the user types 'back'   (go to previous field)
+    $script:ParamCancel = $false  # cleared each prompt; set if the user types 'cancel' (abort action to menu)
     $name    = $Param.Name
     $type    = $Param.ParameterType
     $isArray = $type.IsArray
@@ -732,9 +810,10 @@ function Read-ParameterValue {
     # Say what the field means before asking for it.
     if ($Description) { Write-Host ("  -> {0}" -f $Description) -ForegroundColor White }
 
-    # Single-value field with a fixed set -> numbered pick menu.
-    if ($allowed -and -not $isArray) {
-        return Get-MenuChoice -Title ("Choose a value for -{0}:" -f $name) -Options $allowed
+    # Fixed set of allowed values -> numbered picker (multi-select for arrays).
+    # Both support 'back'/'cancel' via the shared helper.
+    if ($allowed) {
+        return Read-OptionMenu -Name $name -Options $allowed -Multi:$isArray -Description $Description
     }
 
     # Otherwise a prompt line with a human-friendly hint.
@@ -758,6 +837,7 @@ function Read-ParameterValue {
     $label = ('Enter -{0} [{1}]{2}' -f $name, $hint, $(if ($Required) { ' (required)' } else { '' }))
     if ($allowed) { $label += ' - type ? to list options' }
     if ($canFind) { $label += " - or type 'find' to search" }
+    $label += " - or 'back' (previous field) / 'cancel' (menu)"
 
     while ($true) {
         $val = Read-Host $label
@@ -770,6 +850,10 @@ function Read-ParameterValue {
             else              { Write-Host '  Free text - type a value.' -ForegroundColor White }
             continue
         }
+        # 'back' = re-do the previous field; 'cancel' = abort the whole action.
+        # The caller decides what each means in context (see Build-CommandFromCmdlet).
+        if ($key -eq 'back')   { $script:ParamBack   = $true; return $null }
+        if ($key -eq 'cancel') { $script:ParamCancel = $true; return $null }
         if ($key -eq 'find' -and $canFind) {
             $term = Read-Host '  Search text (name or email)'
             if ([string]::IsNullOrWhiteSpace($term)) { continue }
