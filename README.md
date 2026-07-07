@@ -121,6 +121,19 @@ proxy cmdlets that expose things as `Object[]`), teach the tool by adding a row 
 
 ## Status / roadmap
 
+- **v0.8 (2026-07-07):** **Calendar access** category — see who has access to a mailbox's
+  calendar, and grant / change / remove a role (Reviewer, Editor, AvailabilityOnly, …); the
+  mailbox's `\Calendar` folder is targeted automatically, so you only type the person. Merged
+  the shared "Give Full Access" action into the general grant (auto-mapping is now an optional
+  parameter there). Two reusable engine hooks added: per-action `Transform` (post-process a
+  collected value before it runs) and `Hints` (per-action allowed-value override, since
+  `AccessRights` means calendar *roles* here but mailbox *rights* elsewhere). Fixed
+  `Connect-ExchangeOnline` on macOS / PowerShell 7 with `-SkipLoadingFormatData` (avoids the
+  `exchange.format.ps1xml` temp-file error).
+- **v0.7 (2026-07-06):** prompt navigation — type `back` to re-enter the previous field or
+  `cancel` to abort to the menu; a shared numbered **multi-select** picker (`Read-OptionMenu`)
+  for fixed-set fields; and two **mailbox permission view** actions — "See who can Send As a
+  mailbox" and "See who has access to a mailbox".
 - **v0.6 (2026-07-06):** parameter-set resolution (no more spurious required params like
   `-Owner`); `?` explains each optional/switch parameter (action help → glossary → Get-Help,
   with `-LoadCmdletHelp` on EXO connect); validates values against allowed sets and identity
@@ -140,9 +153,8 @@ proxy cmdlets that expose things as `Object[]`), teach the tool by adding a row 
 - **v0.1 (2026-07-03):** connection registry, introspection wizard, dry-run preview,
   transcript logging, a small starter catalogue.
 - **Next / still missing:**
-  - Parameter *sets* aren't handled — cmdlets with mutually-exclusive parameter groups
-    show all parameters mixed together.
   - Legacy AzureAD/MSOnline are retired (not wired, and not worth adding — migrate to Graph).
+  - No piping one action's output into the next.
   - Interactive auth only — no app-only/certificate auth for unattended/scheduled runs.
   - No undo, and destructive cmdlets get the same y/n prompt as a lookup.
   - Optional plain-English → cmdlet layer (via the Claude API) so you can type a request

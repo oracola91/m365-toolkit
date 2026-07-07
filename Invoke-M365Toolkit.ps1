@@ -47,7 +47,10 @@ $Services = @(
         # Builds the parameter splat for the connect cmdlet from the entered email.
         # LoadCmdletHelp so Get-Help works (EXO v3.7+ skips it by default) - lets
         # the tool show real Microsoft parameter descriptions via '?'.
-        ConnectArgs = { param($Upn) @{ UserPrincipalName = $Upn; ShowBanner = $false; LoadCmdletHelp = $true } }
+        # SkipLoadingFormatData avoids the 'exchange.format.ps1xml not found' temp-file
+        # error hit by EXO 3.10 on pwsh 7 / macOS; the toolkit formats output itself
+        # (Show-Result / Save-ResultCsv), so the display format data is not needed.
+        ConnectArgs = { param($Upn) @{ UserPrincipalName = $Upn; ShowBanner = $false; LoadCmdletHelp = $true; SkipLoadingFormatData = $true } }
         Disconnect  = 'Disconnect-ExchangeOnline'
     }
     [pscustomobject]@{
@@ -114,11 +117,12 @@ $Actions = @(
         Service='Exchange Online'; Category='Mailbox access'
         Label='Give a user access to another mailbox (incl. shared mailboxes)'
         Cmdlet='Add-MailboxPermission'; Prompt=@('Identity','User','AccessRights')
-        Help='Grant ONE person the right to open/manage ANOTHER mailbox (a colleague''s or a shared mailbox).'
+        Help='Grant ONE person the right to open/manage ANOTHER mailbox (a colleague''s or a shared mailbox). For a shared mailbox pick FullAccess; to control whether it auto-appears in their Outlook, set the optional AutoMapping parameter.'
         ParamHelp=@{
             Identity     = 'The mailbox that will BE accessed - whose inbox is opened (e.g. a shared mailbox, or a colleague)'
             User         = 'The person who will GET the access'
             AccessRights = 'What they may do. FullAccess = open & manage everything (Send As is a separate action)'
+            AutoMapping  = 'Only meaningful with FullAccess. true = the mailbox appears automatically in the person''s Outlook; false = they add it manually (often preferred for large shared mailboxes)'
         }
     }
     [pscustomobject]@{
@@ -158,6 +162,51 @@ $Actions = @(
         ParamHelp=@{ Identity='The mailbox to check - whose access list you want to see' }
     }
     [pscustomobject]@{
+        Service='Exchange Online'; Category='Calendar access'
+        Label='See who has access to a calendar'
+        Cmdlet='Get-MailboxFolderPermission'; Prompt=@('Identity')
+        Transform=@{ Identity = { param($v) '{0}:\Calendar' -f $v } }
+        Help='List who can see or edit a mailbox''s calendar, and the role each has.'
+        ParamHelp=@{ Identity='The mailbox whose calendar you want to check (email or name) - the tool targets its \Calendar folder automatically' }
+    }
+    [pscustomobject]@{
+        Service='Exchange Online'; Category='Calendar access'
+        Label='Give a user access to a calendar'
+        Cmdlet='Add-MailboxFolderPermission'; Prompt=@('Identity','User','AccessRights')
+        Transform=@{ Identity = { param($v) '{0}:\Calendar' -f $v } }
+        Hints=@{ AccessRights=@('Owner','PublishingEditor','Editor','PublishingAuthor','Author','NonEditingAuthor','Reviewer','Contributor','AvailabilityOnly','LimitedDetails','None') }
+        Help='Grant a person a role on a mailbox''s calendar. Use this only if they have NO existing entry - otherwise use "Change a user''s calendar access".'
+        ParamHelp=@{
+            Identity     = 'The mailbox whose calendar is being shared (its \Calendar folder is targeted automatically)'
+            User         = 'The person who will GET access to the calendar'
+            AccessRights = 'Their role. Reviewer = read events; Editor = create/edit/delete; AvailabilityOnly = free/busy only; LimitedDetails = free/busy + subject & location'
+        }
+    }
+    [pscustomobject]@{
+        Service='Exchange Online'; Category='Calendar access'
+        Label='Change a user''s calendar access'
+        Cmdlet='Set-MailboxFolderPermission'; Prompt=@('Identity','User','AccessRights')
+        Transform=@{ Identity = { param($v) '{0}:\Calendar' -f $v } }
+        Hints=@{ AccessRights=@('Owner','PublishingEditor','Editor','PublishingAuthor','Author','NonEditingAuthor','Reviewer','Contributor','AvailabilityOnly','LimitedDetails','None') }
+        Help='Change the role of someone who ALREADY has access to a calendar (fails if they have no existing entry - use "Give a user access" first).'
+        ParamHelp=@{
+            Identity     = 'The mailbox whose calendar is shared (its \Calendar folder is targeted automatically)'
+            User         = 'The person whose access you are changing'
+            AccessRights = 'The new role (see the grant action for what each role means)'
+        }
+    }
+    [pscustomobject]@{
+        Service='Exchange Online'; Category='Calendar access'
+        Label='Remove a user''s calendar access'
+        Cmdlet='Remove-MailboxFolderPermission'; Prompt=@('Identity','User')
+        Transform=@{ Identity = { param($v) '{0}:\Calendar' -f $v } }
+        Help='Take away a person''s access to a mailbox''s calendar.'
+        ParamHelp=@{
+            Identity = 'The mailbox whose calendar was shared (its \Calendar folder is targeted automatically)'
+            User     = 'The person who will LOSE calendar access'
+        }
+    }
+    [pscustomobject]@{
         Service='Exchange Online'; Category='Mailboxes'; Label='Look up a mailbox'
         Cmdlet='Get-EXOMailbox'; Prompt=@('Identity')
         Help='Show details about a mailbox.'
@@ -195,18 +244,6 @@ $Actions = @(
         Preset=@{ Type='Regular' }
         Help='Turn a shared mailbox back into a normal user mailbox. NOTE: a regular mailbox needs an Exchange Online license assigned, or it gets disabled after ~30 days.'
         ParamHelp=@{ Identity='The shared mailbox to convert back (email address or name)' }
-    }
-    [pscustomobject]@{
-        Service='Exchange Online'; Category='Shared mailboxes'
-        Label='Give Full Access to a shared mailbox (set auto-mapping)'
-        Cmdlet='Add-MailboxPermission'; Prompt=@('Identity','User','AutoMapping')
-        Preset=@{ AccessRights='FullAccess' }
-        Help='Grant Full Access and choose whether the shared mailbox auto-appears in the person''s Outlook.'
-        ParamHelp=@{
-            Identity    = 'The shared mailbox being accessed'
-            User        = 'The person who will GET access'
-            AutoMapping = 'true = it appears automatically in their Outlook; false = they add it manually'
-        }
     }
     [pscustomobject]@{
         Service='Exchange Online'; Category='Groups'; Label='Add a member to a distribution group'
@@ -468,7 +505,9 @@ function Invoke-GuidedCmdlet {
         [string[]]  $Prompt,     # curated params to always walk (required OR optional), in order
         [string]    $Help,       # optional one-line plain description of the whole action
         [hashtable] $ParamHelp,  # optional per-parameter plain descriptions (name -> text)
-        [hashtable] $Preset      # optional param values fixed by the action (never prompted)
+        [hashtable] $Preset,     # optional param values fixed by the action (never prompted)
+        [hashtable] $Hints,      # optional per-action allowed-value overrides (name -> values)
+        [hashtable] $Transform   # optional post-processing of collected values (name -> scriptblock)
     )
 
     $cmd      = Get-Command $Cmdlet -ErrorAction Stop
@@ -510,7 +549,7 @@ function Invoke-GuidedCmdlet {
     while ($ri -lt $reqList.Count) {
         $p = $reqList[$ri]
         $desc = Get-ParamDescription -Name $p.Name -ParamHelp $ParamHelp -Cmdlet $Cmdlet
-        $val = Read-ParameterValue -Param $p -Required -Description $desc
+        $val = Read-ParameterValue -Param $p -Required -Description $desc -Hints $Hints
         if ($script:ParamCancel) { Write-Host 'Cancelled - back to the menu (nothing was run).' -ForegroundColor White; return }
         if ($script:ParamBack) {
             if ($ri -eq 0) { Write-Host "  Already at the first field - type 'cancel' to return to the menu." -ForegroundColor White; continue }
@@ -526,7 +565,7 @@ function Invoke-GuidedCmdlet {
     # ---- Optional params named in the curated list: ask them outright.
     foreach ($p in ($optional | Where-Object { $promptList -contains $_.Name -and -not $bound.Contains($_.Name) })) {
         $desc = Get-ParamDescription -Name $p.Name -ParamHelp $ParamHelp -Cmdlet $Cmdlet
-        $v = Read-ParameterValue -Param $p -Description $desc
+        $v = Read-ParameterValue -Param $p -Description $desc -Hints $Hints
         if ($script:ParamBack -or $script:ParamCancel) { Write-Host 'Cancelled - back to the menu (nothing was run).' -ForegroundColor White; return }
         if ($null -ne $v) { $bound[$p.Name] = $v }
     }
@@ -555,7 +594,7 @@ function Invoke-GuidedCmdlet {
             if ($idx -ge 0 -and $idx -lt $optRest.Count) {
                 $p = $optRest[$idx]
                 $desc = Get-ParamDescription -Name $p.Name -ParamHelp $ParamHelp -Cmdlet $Cmdlet
-                $bound[$p.Name] = Read-ParameterValue -Param $p -Description $desc
+                $bound[$p.Name] = Read-ParameterValue -Param $p -Description $desc -Hints $Hints
                 if ($script:ParamBack -or $script:ParamCancel) { Write-Host 'Cancelled - back to the menu (nothing was run).' -ForegroundColor White; return }
             }
         }
@@ -583,6 +622,16 @@ function Invoke-GuidedCmdlet {
         foreach ($n in ($pick -split '[,\s]+' | Where-Object { $_ -match '^\d+$' })) {
             $idx = [int]$n - 1
             if ($idx -ge 0 -and $idx -lt $swRest.Count) { $bound[$swRest[$idx].Name] = $true }
+        }
+    }
+
+    # ---- Action transforms: post-process a collected value before it is used
+    #      (e.g. append ':\Calendar' to a mailbox identity so a folder-permission
+    #      cmdlet targets that mailbox's calendar). Applied just before preview so
+    #      the dry-run shows the exact value that will be submitted.
+    if ($Transform) {
+        foreach ($tk in $Transform.Keys) {
+            if ($bound.Contains($tk)) { $bound[$tk] = & $Transform[$tk] $bound[$tk] }
         }
     }
 
@@ -626,7 +675,8 @@ function Invoke-BulkCmdlet {
         [Parameter(Mandatory)] [string] $Cmdlet,
         [string[]]  $Prompt,
         [hashtable] $ParamHelp,
-        [hashtable] $Preset
+        [hashtable] $Preset,
+        [hashtable] $Transform   # optional post-processing of each row's values (name -> scriptblock)
     )
     $cmd   = Get-Command $Cmdlet -ErrorAction Stop
     $parts = Get-CmdletParameters -Cmd $cmd -PreferParams $Prompt
@@ -702,6 +752,11 @@ function Invoke-BulkCmdlet {
                 'column' { $b[$k] = $row.$($m.Value) }
                 'fixed'  { $b[$k] = $m.Value }
                 'switch' { $b[$k] = $true }
+            }
+        }
+        if ($Transform) {
+            foreach ($tk in $Transform.Keys) {
+                if ($b.Contains($tk)) { $b[$tk] = & $Transform[$tk] $b[$tk] }
             }
         }
         $b
@@ -789,7 +844,8 @@ function Read-ParameterValue {
     param(
         [Parameter(Mandatory)] $Param,
         [switch] $Required,
-        [string] $Description   # plain-language "what is this field?" shown above the prompt
+        [string] $Description,  # plain-language "what is this field?" shown above the prompt
+        [hashtable] $Hints      # per-action allowed-value override (name -> values); beats global $ParamHints
     )
     $script:ParamBack   = $false  # cleared each prompt; set if the user types 'back'   (go to previous field)
     $script:ParamCancel = $false  # cleared each prompt; set if the user types 'cancel' (abort action to menu)
@@ -803,9 +859,10 @@ function Read-ParameterValue {
     # (needed for Exchange proxy cmdlets that hide their real type as Object[]).
     $allowed = $null
     $validate = $Param.Attributes | Where-Object { $_ -is [System.Management.Automation.ValidateSetAttribute] } | Select-Object -First 1
-    if     ($validate)                      { $allowed = [string[]]$validate.ValidValues }
-    elseif ($elem.IsEnum)                   { $allowed = [string[]][enum]::GetNames($elem) }
-    elseif ($ParamHints.ContainsKey($name)) { $allowed = [string[]]$ParamHints[$name] }
+    if     ($validate)                              { $allowed = [string[]]$validate.ValidValues }
+    elseif ($elem.IsEnum)                           { $allowed = [string[]][enum]::GetNames($elem) }
+    elseif ($Hints -and $Hints.ContainsKey($name))  { $allowed = [string[]]$Hints[$name] }
+    elseif ($ParamHints.ContainsKey($name))         { $allowed = [string[]]$ParamHints[$name] }
 
     # Say what the field means before asking for it.
     if ($Description) { Write-Host ("  -> {0}" -f $Description) -ForegroundColor White }
@@ -1029,9 +1086,9 @@ function Invoke-Action {
                 -Options @('Run once (type the values now)','Bulk - run for every row in a CSV file') -AllowBack
     if (-not $mode) { return 'again' }
     if ($mode -like 'Bulk*') {
-        Invoke-BulkCmdlet  -Cmdlet $Action.Cmdlet -Prompt $Action.Prompt -ParamHelp $Action.ParamHelp -Preset $Action.Preset
+        Invoke-BulkCmdlet  -Cmdlet $Action.Cmdlet -Prompt $Action.Prompt -ParamHelp $Action.ParamHelp -Preset $Action.Preset -Transform $Action.Transform
     } else {
-        Invoke-GuidedCmdlet -Cmdlet $Action.Cmdlet -Prompt $Action.Prompt -Help $Action.Help -ParamHelp $Action.ParamHelp -Preset $Action.Preset
+        Invoke-GuidedCmdlet -Cmdlet $Action.Cmdlet -Prompt $Action.Prompt -Help $Action.Help -ParamHelp $Action.ParamHelp -Preset $Action.Preset -Hints $Action.Hints -Transform $Action.Transform
     }
     Get-NextStep
 }
@@ -1047,7 +1104,7 @@ function Start-M365Toolkit {
     Start-Transcript -Path $logFile -Append | Out-Null
     try {
         Write-Host '=====================================================' -ForegroundColor White
-        Write-Host '  Microsoft 365 Guided Command Builder  (v0.6)'        -ForegroundColor White
+        Write-Host '  Microsoft 365 Guided Command Builder  (v0.8)'        -ForegroundColor White
         Write-Host '=====================================================' -ForegroundColor White
 
         $cfg = Get-ToolkitConfig
