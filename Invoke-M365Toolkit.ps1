@@ -345,12 +345,21 @@ function Get-MenuChoice {
         [Parameter(Mandatory)] [string]   $Title,
         [Parameter(Mandatory)] [string[]] $Options,
         [string[]] $Descriptions,   # optional, parallel to $Options: shown when the user types ?
+        [string[]] $ExtraOptions,   # app-level controls (Search / Switch service / Quit ...): shown below a divider, still numbered & selectable
         [switch] $AllowBack
     )
+    $all = @($Options) + @($ExtraOptions)   # combined for selection; numbering runs continuously
     Write-Host ''
     Write-Host $Title -ForegroundColor White
     for ($i = 0; $i -lt $Options.Count; $i++) {
         Write-Host ('  {0,2}. {1}' -f ($i + 1), $Options[$i])
+    }
+    if ($ExtraOptions) {
+        # App-level controls, kept separate from the menu's own items.
+        Write-Host '   -------- app --------' -ForegroundColor White
+        for ($j = 0; $j -lt $ExtraOptions.Count; $j++) {
+            Write-Host ('  {0,2}. {1}' -f ($Options.Count + $j + 1), $ExtraOptions[$j]) -ForegroundColor White
+        }
     }
     if ($AllowBack) { Write-Host '   0. Back' -ForegroundColor White }
     if ($Descriptions) { Write-Host '   (type ? for a short explanation of each choice)' -ForegroundColor White }
@@ -365,8 +374,8 @@ function Get-MenuChoice {
             continue
         }
         if ($AllowBack -and $raw -eq '0') { return $null }
-        if ($raw -match '^\d+$' -and [int]$raw -ge 1 -and [int]$raw -le $Options.Count) {
-            return $Options[[int]$raw - 1]
+        if ($raw -match '^\d+$' -and [int]$raw -ge 1 -and [int]$raw -le $all.Count) {
+            return $all[[int]$raw - 1]
         }
         Write-Host 'Not a valid choice, try again.' -ForegroundColor Yellow
     }
@@ -1116,11 +1125,11 @@ function Start-M365Toolkit {
         $quit = $false
         while ($true) {
             # Choose / switch service - offer the last-used one first.
-            $svcNames = @($Services.Name)
+            $svcNames = @($Services.Name | Sort-Object)   # A-Z; last-used floated to the top below
             if ($cfg.LastService -and ($svcNames -contains $cfg.LastService)) {
                 $svcNames = @($cfg.LastService) + @($svcNames | Where-Object { $_ -ne $cfg.LastService })
             }
-            $svcName = Get-MenuChoice -Title 'Connect to which service?' -Options ($svcNames + 'Quit')
+            $svcName = Get-MenuChoice -Title 'Connect to which service?' -Options $svcNames -ExtraOptions @('Quit')
             if ($svcName -eq 'Quit') { break }
 
             $service = $Services | Where-Object { $_.Name -eq $svcName }
@@ -1139,9 +1148,10 @@ function Start-M365Toolkit {
                     Write-Host '(You can still extend $Actions - or point the engine at any cmdlet.)' -ForegroundColor White
                 }
 
-                $categories = @($svcActions.Category | Select-Object -Unique)
+                $categories = @($svcActions.Category | Select-Object -Unique | Sort-Object)   # A-Z; fixed items appended after
                 $cat = Get-MenuChoice -Title "[$svcName] Choose a category" `
-                            -Options (@($categories) + 'Search actions by keyword' + 'Run any command by name (advanced)' + 'Switch service') -AllowBack
+                            -Options @($categories) `
+                            -ExtraOptions @('Search actions by keyword','Run any command by name (advanced)','Switch service') -AllowBack
                 if (-not $cat -or $cat -eq 'Switch service') { break }
 
                 # Keyword search across this service's actions (name / cmdlet / category).
@@ -1149,7 +1159,7 @@ function Start-M365Toolkit {
                     $kw = (Read-Host 'Keyword (matches action name, cmdlet, or category)').Trim()
                     if ($kw) {
                         $rx = [regex]::Escape($kw)
-                        $hits = @($svcActions | Where-Object { $_.Label -match $rx -or $_.Cmdlet -match $rx -or $_.Category -match $rx })
+                        $hits = @($svcActions | Where-Object { $_.Label -match $rx -or $_.Cmdlet -match $rx -or $_.Category -match $rx } | Sort-Object Label)   # results A-Z
                         if ($hits.Count -eq 0) { Write-Host "No actions match '$kw'." -ForegroundColor Yellow }
                         else {
                             $lbl = Get-MenuChoice -Title "Actions matching '$kw'" `
@@ -1182,7 +1192,7 @@ function Start-M365Toolkit {
                     continue
                 }
 
-                $catActions = @($svcActions | Where-Object { $_.Category -eq $cat })
+                $catActions = @($svcActions | Where-Object { $_.Category -eq $cat } | Sort-Object Label)   # actions A-Z
                 $label = Get-MenuChoice -Title "[$svcName / $cat] Choose an action" `
                             -Options $catActions.Label `
                             -Descriptions @($catActions | ForEach-Object { [string]$_.Help }) `

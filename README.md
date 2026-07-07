@@ -129,7 +129,10 @@ proxy cmdlets that expose things as `Object[]`), teach the tool by adding a row 
   collected value before it runs) and `Hints` (per-action allowed-value override, since
   `AccessRights` means calendar *roles* here but mailbox *rights* elsewhere). Fixed
   `Connect-ExchangeOnline` on macOS / PowerShell 7 with `-SkipLoadingFormatData` (avoids the
-  `exchange.format.ps1xml` temp-file error).
+  `exchange.format.ps1xml` temp-file error). **UI:** all menus now list **A-Z** (categories,
+  actions, services — last-used service still floated to the top); app controls (Search / Run
+  any command / Switch service / Quit) render below a `-- app --` divider, visually separated
+  from the menu's own items.
 - **v0.7 (2026-07-06):** prompt navigation — type `back` to re-enter the previous field or
   `cancel` to abort to the menu; a shared numbered **multi-select** picker (`Read-OptionMenu`)
   for fixed-set fields; and two **mailbox permission view** actions — "See who can Send As a
