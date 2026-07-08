@@ -16,7 +16,7 @@
       3. $Actions   - plain-language catalogue: friendly label -> cmdlet.
 
 .NOTES
-    v0.11 - 2026-07-08. Runs on Windows PowerShell 5.1 or PowerShell 7+.
+    v0.12 - 2026-07-08. Runs on Windows PowerShell 5.1 or PowerShell 7+.
     Requires the relevant module installed for whichever service you connect to.
 #>
 
@@ -188,6 +188,29 @@ $Actions = @(
                     'DynamicDistributionGroup'       { 'Dynamic distribution group' }
                     'GroupMailbox'                   { 'Microsoft 365 group' }
                     default                          { if ($rt) { $rt } else { 'Group' } }
+                }
+                [pscustomobject]@{ Name = [string]$_.DisplayName; Email = [string]$_.PrimarySmtpAddress; Type = $type }
+            }
+        }
+    }
+    [pscustomobject]@{
+        Service='Exchange Online'; Category='Check access'
+        Label='See who is in a distribution group'
+        Cmdlet='Get-DistributionGroupMember'; Prompt=@('Identity')
+        Preset=@{ ResultSize='Unlimited' }
+        Help='List the members of a distribution group / mailing list (who is IN the group). Type the group; find / last work too.'
+        ParamHelp=@{ Identity='The distribution group whose members you want (email or name)' }
+        Project={ param($r)
+            @($r) | ForEach-Object {
+                $rt = [string]$_.RecipientTypeDetails; if (-not $rt) { $rt = [string]$_.RecipientType }
+                $type = switch ($rt) {
+                    'UserMailbox'                    { 'User' }
+                    'SharedMailbox'                  { 'Shared mailbox' }
+                    'MailUniversalDistributionGroup' { 'Distribution group (nested)' }
+                    'MailUniversalSecurityGroup'     { 'Mail-enabled security' }
+                    'MailContact'                    { 'Contact' }
+                    'MailUser'                       { 'Mail user' }
+                    default                          { if ($rt) { $rt } else { 'Member' } }
                 }
                 [pscustomobject]@{ Name = [string]$_.DisplayName; Email = [string]$_.PrimarySmtpAddress; Type = $type }
             }
@@ -1244,7 +1267,7 @@ function Start-M365Toolkit {
     Start-Transcript -Path $logFile -Append | Out-Null
     try {
         Write-Host '=====================================================' -ForegroundColor White
-        Write-Host '  Microsoft 365 Guided Command Builder  (v0.11)'       -ForegroundColor White
+        Write-Host '  Microsoft 365 Guided Command Builder  (v0.12)'       -ForegroundColor White
         Write-Host '=====================================================' -ForegroundColor White
 
         $cfg = Get-ToolkitConfig
