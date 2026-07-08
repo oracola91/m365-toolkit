@@ -16,7 +16,7 @@
       3. $Actions   - plain-language catalogue: friendly label -> cmdlet.
 
 .NOTES
-    v0.9 - 2026-07-08. Runs on Windows PowerShell 5.1 or PowerShell 7+.
+    v0.10 - 2026-07-08. Runs on Windows PowerShell 5.1 or PowerShell 7+.
     Requires the relevant module installed for whichever service you connect to.
 #>
 
@@ -114,7 +114,7 @@ $Services = @(
 # ---------------------------------------------------------------------------
 $Actions = @(
     [pscustomobject]@{
-        Service='Exchange Online'; Category='Mailbox access'
+        Service='Exchange Online'; Category='Give access'
         Label='Give a user access to another mailbox (incl. shared mailboxes)'
         Cmdlet='Add-MailboxPermission'; Prompt=@('Identity','User','AccessRights')
         Help='Grant ONE person the right to open/manage ANOTHER mailbox (a colleague''s or a shared mailbox). For a shared mailbox pick FullAccess; to control whether it auto-appears in their Outlook, set the optional AutoMapping parameter.'
@@ -126,7 +126,7 @@ $Actions = @(
         }
     }
     [pscustomobject]@{
-        Service='Exchange Online'; Category='Mailbox access'
+        Service='Exchange Online'; Category='Remove & change access'
         Label='Remove a user''s access to a mailbox'
         Cmdlet='Remove-MailboxPermission'; Prompt=@('Identity','User','AccessRights')
         Help='Take away access that was previously granted.'
@@ -137,7 +137,7 @@ $Actions = @(
         }
     }
     [pscustomobject]@{
-        Service='Exchange Online'; Category='Mailbox access'
+        Service='Exchange Online'; Category='Give access'
         Label='Let a user send AS another mailbox (Send As)'
         Cmdlet='Add-RecipientPermission'; Prompt=@('Identity','Trustee')
         Preset=@{ AccessRights='SendAs' }
@@ -148,21 +148,21 @@ $Actions = @(
         }
     }
     [pscustomobject]@{
-        Service='Exchange Online'; Category='Mailbox access'
+        Service='Exchange Online'; Category='Check access'
         Label='See who can Send As a mailbox'
         Cmdlet='Get-RecipientPermission'; Prompt=@('Identity')
         Help='List everyone who has Send As on a mailbox - use it to verify a Send As grant.'
         ParamHelp=@{ Identity='The mailbox to check - the one others may send email AS' }
     }
     [pscustomobject]@{
-        Service='Exchange Online'; Category='Mailbox access'
+        Service='Exchange Online'; Category='Check access'
         Label='See who has access to a mailbox (FullAccess etc.)'
         Cmdlet='Get-MailboxPermission'; Prompt=@('Identity')
         Help='List who can open/manage a mailbox. NOTE: "NT AUTHORITY\SELF" and inherited rows are normal system entries - the real grants are the named users.'
         ParamHelp=@{ Identity='The mailbox to check - whose access list you want to see' }
     }
     [pscustomobject]@{
-        Service='Exchange Online'; Category='Calendar access'
+        Service='Exchange Online'; Category='Check access'
         Label='See who has access to a calendar'
         Cmdlet='Get-MailboxFolderPermission'; Prompt=@('Identity')
         Transform=@{ Identity = { param($v) '{0}:\Calendar' -f $v } }
@@ -170,7 +170,7 @@ $Actions = @(
         ParamHelp=@{ Identity='The mailbox whose calendar you want to check (email or name) - the tool targets its \Calendar folder automatically' }
     }
     [pscustomobject]@{
-        Service='Exchange Online'; Category='Calendar access'
+        Service='Exchange Online'; Category='Give access'
         Label='Give a user access to a calendar'
         Cmdlet='Add-MailboxFolderPermission'; Prompt=@('Identity','User','AccessRights')
         Transform=@{ Identity = { param($v) '{0}:\Calendar' -f $v } }
@@ -183,7 +183,7 @@ $Actions = @(
         }
     }
     [pscustomobject]@{
-        Service='Exchange Online'; Category='Calendar access'
+        Service='Exchange Online'; Category='Remove & change access'
         Label='Change a user''s calendar access'
         Cmdlet='Set-MailboxFolderPermission'; Prompt=@('Identity','User','AccessRights')
         Transform=@{ Identity = { param($v) '{0}:\Calendar' -f $v } }
@@ -196,7 +196,7 @@ $Actions = @(
         }
     }
     [pscustomobject]@{
-        Service='Exchange Online'; Category='Calendar access'
+        Service='Exchange Online'; Category='Remove & change access'
         Label='Remove a user''s calendar access'
         Cmdlet='Remove-MailboxFolderPermission'; Prompt=@('Identity','User')
         Transform=@{ Identity = { param($v) '{0}:\Calendar' -f $v } }
@@ -218,7 +218,7 @@ $Actions = @(
         Help='Change a setting on a mailbox (advanced - walks all available options).'
     }
     [pscustomobject]@{
-        Service='Exchange Online'; Category='Shared mailboxes'
+        Service='Exchange Online'; Category='Mailboxes'
         Label='Create a new shared mailbox'
         Cmdlet='New-Mailbox'; Prompt=@('Name','DisplayName','PrimarySmtpAddress')
         Preset=@{ Shared=$true }
@@ -230,7 +230,7 @@ $Actions = @(
         }
     }
     [pscustomobject]@{
-        Service='Exchange Online'; Category='Shared mailboxes'
+        Service='Exchange Online'; Category='Mailboxes'
         Label='Convert an existing mailbox to shared'
         Cmdlet='Set-Mailbox'; Prompt=@('Identity')
         Preset=@{ Type='Shared' }
@@ -238,7 +238,7 @@ $Actions = @(
         ParamHelp=@{ Identity='The mailbox to convert (email address or name)' }
     }
     [pscustomobject]@{
-        Service='Exchange Online'; Category='Shared mailboxes'
+        Service='Exchange Online'; Category='Mailboxes'
         Label='Convert a shared mailbox back to a regular (user) mailbox'
         Cmdlet='Set-Mailbox'; Prompt=@('Identity')
         Preset=@{ Type='Regular' }
@@ -246,7 +246,7 @@ $Actions = @(
         ParamHelp=@{ Identity='The shared mailbox to convert back (email address or name)' }
     }
     [pscustomobject]@{
-        Service='Exchange Online'; Category='Groups'; Label='Add a member to a distribution group'
+        Service='Exchange Online'; Category='Give access'; Label='Add a member to a distribution group'
         Cmdlet='Add-DistributionGroupMember'; Prompt=@('Identity','Member')
         Help='Add someone to a distribution / mailing group.'
         ParamHelp=@{ Identity='The group to add TO'; Member='The person being ADDED' }
@@ -256,6 +256,43 @@ $Actions = @(
         Cmdlet='Get-MgUser'; Prompt=@('UserId')
         Help='Show details about a user account.'
         ParamHelp=@{ UserId='The user to look up (email or object id)' }
+    }
+    [pscustomobject]@{
+        Service='Entra / Identity (Graph)'; Category='Check access'
+        Label='See which groups a user is in'
+        Cmdlet='Get-MgUserMemberOf'; Prompt=@('UserId')
+        Preset=@{ All=$true }
+        Help='List EVERY group (and directory role) a user belongs to, each labelled with what it is - Distribution group, Microsoft 365 group, Security group, Mail-enabled security, or Directory role.'
+        ParamHelp=@{ UserId='The user whose memberships you want (email or object id). Type find to search the directory, or last to reuse someone from a previous result.' }
+        # Get-MgUserMemberOf returns raw directory objects whose useful fields sit
+        # in an AdditionalProperties bag. Flatten to clean Name / Email / Type so
+        # the table is readable (and so the Type says WHAT each group is).
+        Project={
+            param($r)
+            @($r) | ForEach-Object {
+                $ap = $_.AdditionalProperties; if (-not $ap) { $ap = @{} }
+                $odata = [string]$ap['@odata.type']
+                $type =
+                    if     ($odata -match 'directoryRole') { 'Directory role' }
+                    elseif ($odata -match 'group' -or $ap.ContainsKey('groupTypes')) {
+                        $gt   = @($ap['groupTypes'])
+                        $mail = [bool]$ap['mailEnabled']
+                        $sec  = [bool]$ap['securityEnabled']
+                        if     ($gt -contains 'Unified') { 'Microsoft 365 group' }
+                        elseif ($mail -and $sec)         { 'Mail-enabled security' }
+                        elseif ($mail)                   { 'Distribution group' }
+                        elseif ($sec)                    { 'Security group' }
+                        else                             { 'Group' }
+                    }
+                    elseif ($odata) { $odata -replace '#microsoft\.graph\.','' }
+                    else            { 'Object' }
+                [pscustomobject]@{
+                    Name  = [string]$ap['displayName']
+                    Email = [string]$ap['mail']
+                    Type  = $type
+                }
+            }
+        }
     }
     [pscustomobject]@{
         Service='SharePoint Admin (SPO)'; Category='Sites'; Label='List all SharePoint sites'
@@ -516,7 +553,8 @@ function Invoke-GuidedCmdlet {
         [hashtable] $ParamHelp,  # optional per-parameter plain descriptions (name -> text)
         [hashtable] $Preset,     # optional param values fixed by the action (never prompted)
         [hashtable] $Hints,      # optional per-action allowed-value overrides (name -> values)
-        [hashtable] $Transform   # optional post-processing of collected values (name -> scriptblock)
+        [hashtable] $Transform,  # optional post-processing of collected values (name -> scriptblock)
+        [scriptblock] $Project   # optional reshaping of the RESULT before display (raw result -> clean objects)
     )
 
     $cmd      = Get-Command $Cmdlet -ErrorAction Stop
@@ -668,6 +706,13 @@ function Invoke-GuidedCmdlet {
     try {
         $result = & $Cmdlet @bound -ErrorAction Stop
         Write-Host 'Done.' -ForegroundColor Green
+        # Optional per-action projection: reshape a raw/cluttered result into clean,
+        # readable columns (e.g. flatten Get-MgUserMemberOf into Name/Email/Type)
+        # before it is shown AND before it becomes the pipe source for 'last'.
+        if ($Project) {
+            try   { $result = & $Project $result }
+            catch { Write-Host ('  (could not reshape result: {0})' -f $_.Exception.Message) -ForegroundColor Yellow }
+        }
         Show-Result -Result $result -Cmdlet $Cmdlet
     } catch {
         Write-Host ('Failed: {0}' -f $_.Exception.Message) -ForegroundColor Red
@@ -942,7 +987,7 @@ function Read-ParameterValue {
         if ($key -eq 'last' -and $hasLast) {
             $rows = @($script:LastResult)
             $cols = @($rows[0].PSObject.Properties.Name)
-            $idCols = @('PrimarySmtpAddress','UserPrincipalName','Identity','Id','Mail','WindowsEmailAddress')
+            $idCols = @('PrimarySmtpAddress','UserPrincipalName','Mail','Email','Identity','Id','WindowsEmailAddress')
             $col = $idCols | Where-Object { $cols -contains $_ } | Select-Object -First 1
             if (-not $col) {
                 $col = Get-MenuChoice -Title '  Which value from the last result?' -Options $cols -AllowBack
@@ -1138,7 +1183,7 @@ function Invoke-Action {
     if ($mode -like 'Bulk*') {
         Invoke-BulkCmdlet  -Cmdlet $Action.Cmdlet -Prompt $Action.Prompt -ParamHelp $Action.ParamHelp -Preset $Action.Preset -Transform $Action.Transform
     } else {
-        Invoke-GuidedCmdlet -Cmdlet $Action.Cmdlet -Prompt $Action.Prompt -Help $Action.Help -ParamHelp $Action.ParamHelp -Preset $Action.Preset -Hints $Action.Hints -Transform $Action.Transform
+        Invoke-GuidedCmdlet -Cmdlet $Action.Cmdlet -Prompt $Action.Prompt -Help $Action.Help -ParamHelp $Action.ParamHelp -Preset $Action.Preset -Hints $Action.Hints -Transform $Action.Transform -Project $Action.Project
     }
     Get-NextStep
 }
@@ -1160,7 +1205,7 @@ function Start-M365Toolkit {
     Start-Transcript -Path $logFile -Append | Out-Null
     try {
         Write-Host '=====================================================' -ForegroundColor White
-        Write-Host '  Microsoft 365 Guided Command Builder  (v0.9)'        -ForegroundColor White
+        Write-Host '  Microsoft 365 Guided Command Builder  (v0.10)'       -ForegroundColor White
         Write-Host '=====================================================' -ForegroundColor White
 
         $cfg = Get-ToolkitConfig
