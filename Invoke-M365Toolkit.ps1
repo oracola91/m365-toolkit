@@ -434,7 +434,13 @@ function Connect-M365Service {
             throw "Cannot connect without module '$($Service.Module)'."
         }
     }
-    Import-Module $Service.Module -ErrorAction SilentlyContinue
+    # Import quietly. On macOS / pwsh 7 a stale ExchangeOnlineManagement temp
+    # format file (left by an earlier EXO session in the SAME shell) can make a
+    # later Import-Module of ANY module surface a 'exchange.format.ps1xml not
+    # found' error - and with $ErrorActionPreference='Stop' that halts the
+    # connect. It is harmless here (the toolkit formats its own output), so
+    # swallow all import noise and never let it stop us.
+    try { Import-Module $Service.Module -ErrorAction SilentlyContinue -WarningAction SilentlyContinue 2>$null } catch { }
     $connectArgs = & $Service.ConnectArgs $Upn
     Write-Host ("Connecting to {0} as {1} ..." -f $Service.Name, $Upn) -ForegroundColor White
     & $Service.ConnectCmd @connectArgs
@@ -1205,7 +1211,7 @@ function Start-M365Toolkit {
     Start-Transcript -Path $logFile -Append | Out-Null
     try {
         Write-Host '=====================================================' -ForegroundColor White
-        Write-Host '  Microsoft 365 Guided Command Builder  (v0.10)'       -ForegroundColor White
+        Write-Host '  Microsoft 365 Guided Command Builder  (v0.10.1)'     -ForegroundColor White
         Write-Host '=====================================================' -ForegroundColor White
 
         $cfg = Get-ToolkitConfig
