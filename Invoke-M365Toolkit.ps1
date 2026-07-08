@@ -16,7 +16,7 @@
       3. $Actions   - plain-language catalogue: friendly label -> cmdlet.
 
 .NOTES
-    Skeleton / v0.1 - 2026-07-03. Runs on Windows PowerShell 5.1 or PowerShell 7+.
+    v0.9 - 2026-07-08. Runs on Windows PowerShell 5.1 or PowerShell 7+.
     Requires the relevant module installed for whichever service you connect to.
 #>
 
@@ -899,10 +899,14 @@ function Read-ParameterValue {
     # AND its probe cmdlet is loaded (i.e. we're connected to the right service).
     $lookup  = $ParamLookup[$name]
     $canFind = $lookup -and (Get-Command $lookup.Probe -ErrorAction SilentlyContinue)
+    # Piping: offer 'last' when the previous action returned objects. Scalar
+    # fields only in v1 (array fields keep their comma-separated free entry).
+    $hasLast = (@($script:LastResult).Count -gt 0) -and (-not $isArray)
 
     $label = ('Enter -{0} [{1}]{2}' -f $name, $hint, $(if ($Required) { ' (required)' } else { '' }))
     if ($allowed) { $label += ' - type ? to list options' }
     if ($canFind) { $label += " - or type 'find' to search" }
+    if ($hasLast) { $label += " - or 'last' to reuse a value from the last result" }
     $label += " - or 'back' (previous field) / 'cancel' (menu)"
 
     while ($true) {
@@ -929,6 +933,36 @@ function Read-ParameterValue {
             $pick = Get-MenuChoice -Title '  Pick one:' -Options @($hits.Display) -AllowBack
             if (-not $pick) { continue }
             $sel = $hits | Where-Object { $_.Display -eq $pick } | Select-Object -First 1
+            Write-Host ('  -> using {0}' -f $sel.Value) -ForegroundColor White
+            return $sel.Value
+        }
+        # 'last' = pipe a value out of the previous action's result. Pick a
+        # column (defaulting to the first identity-like one), then pick a row;
+        # returns that cell as a scalar, mirroring the 'find' branch above.
+        if ($key -eq 'last' -and $hasLast) {
+            $rows = @($script:LastResult)
+            $cols = @($rows[0].PSObject.Properties.Name)
+            $idCols = @('PrimarySmtpAddress','UserPrincipalName','Identity','Id','Mail','WindowsEmailAddress')
+            $col = $idCols | Where-Object { $cols -contains $_ } | Select-Object -First 1
+            if (-not $col) {
+                $col = Get-MenuChoice -Title '  Which value from the last result?' -Options $cols -AllowBack
+                if (-not $col) { continue }
+            }
+            # Show a second column (DisplayName/Name) for context when present.
+            $ctxCol = @('DisplayName','Name') | Where-Object { $cols -contains $_ -and $_ -ne $col } | Select-Object -First 1
+            $choices = foreach ($r in $rows) {
+                $v = [string]$r.$col
+                if ([string]::IsNullOrWhiteSpace($v)) { continue }
+                $disp = if ($ctxCol) { '{0}  ({1})' -f $v, [string]$r.$ctxCol } else { $v }
+                [pscustomobject]@{ Display = $disp; Value = $v }
+            }
+            $choices = @($choices)
+            if ($choices.Count -eq 0) {
+                Write-Host ("  The last result has no '{0}' values to use." -f $col) -ForegroundColor Yellow; continue
+            }
+            $pick = Get-MenuChoice -Title ("  Pick a {0} from the last result:" -f $col) -Options @($choices.Display) -AllowBack
+            if (-not $pick) { continue }
+            $sel = $choices | Where-Object { $_.Display -eq $pick } | Select-Object -First 1
             Write-Host ('  -> using {0}' -f $sel.Value) -ForegroundColor White
             return $sel.Value
         }
@@ -1015,6 +1049,13 @@ function Show-Result {
         $items | ForEach-Object { Write-Host ("  {0}" -f $_) }
         return
     }
+
+    # Remember this result so the NEXT action can pipe a value out of it (the
+    # 'last' keyword in Read-ParameterValue). Scalars/strings aren't useful as a
+    # pipe source, so only real objects reach here and get stored.
+    $script:LastResult = $items
+    $script:LastResultCmdlet = $Cmdlet
+    Write-Host "Tip: in the next action, type 'last' at a field to reuse a value from these results." -ForegroundColor White
 
     while ($true) {
         $choice = Get-MenuChoice -Title 'What do you want to do with the results?' -Options @(
@@ -1106,6 +1147,12 @@ function Invoke-Action {
 # Main loop
 # ===========================================================================
 function Start-M365Toolkit {
+    # Session state for output piping (the 'last' keyword in Read-ParameterValue):
+    # the most recent result set and the cmdlet that produced it. Populated by
+    # Show-Result; in-memory only (not persisted across sessions).
+    $script:LastResult = @()
+    $script:LastResultCmdlet = $null
+
     $logDir = Join-Path $script:ToolkitHome 'logs'
     if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out-Null }
     $stamp  = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -1113,7 +1160,7 @@ function Start-M365Toolkit {
     Start-Transcript -Path $logFile -Append | Out-Null
     try {
         Write-Host '=====================================================' -ForegroundColor White
-        Write-Host '  Microsoft 365 Guided Command Builder  (v0.8)'        -ForegroundColor White
+        Write-Host '  Microsoft 365 Guided Command Builder  (v0.9)'        -ForegroundColor White
         Write-Host '=====================================================' -ForegroundColor White
 
         $cfg = Get-ToolkitConfig
