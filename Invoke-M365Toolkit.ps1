@@ -16,7 +16,7 @@
       3. $Actions   - plain-language catalogue: friendly label -> cmdlet.
 
 .NOTES
-    v0.12 - 2026-07-08. Runs on Windows PowerShell 5.1 or PowerShell 7+.
+    v0.13 - 2026-07-08. Runs on Windows PowerShell 5.1 or PowerShell 7+.
     Requires the relevant module installed for whichever service you connect to.
 #>
 
@@ -107,6 +107,25 @@ $Services = @(
         Disconnect  = 'Remove-PowerAppsAccount'
     }
 )
+
+# ---------------------------------------------------------------------------
+# Helper "cmdlets" that back catalogue actions needing more than one call. The
+# engine drives these via Get-Command exactly like a real cmdlet, so they just
+# expose a normal param() block and return objects (reshaped by the action's
+# Project). Add one here when no single built-in cmdlet can answer a question.
+# ---------------------------------------------------------------------------
+function Get-UserSharedMailboxAccess {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [string] $User)
+    # No reverse index exists ("which mailboxes can X open?"), so scan the shared
+    # mailboxes and keep those where the user has a direct (non-inherited)
+    # FullAccess grant. Can take a minute on tenants with many shared mailboxes.
+    Get-Mailbox -ResultSize Unlimited -RecipientTypeDetails SharedMailbox -ErrorAction Stop |
+        Where-Object {
+            @(Get-MailboxPermission -Identity $_.Identity -User $User -ErrorAction SilentlyContinue |
+                Where-Object { $_.AccessRights -contains 'FullAccess' -and -not $_.IsInherited }).Count -gt 0
+        }
+}
 
 # ---------------------------------------------------------------------------
 # Layer 3: Plain-language action catalogue. Add an action = add one row here.
@@ -213,6 +232,18 @@ $Actions = @(
                     default                          { if ($rt) { $rt } else { 'Member' } }
                 }
                 [pscustomobject]@{ Name = [string]$_.DisplayName; Email = [string]$_.PrimarySmtpAddress; Type = $type }
+            }
+        }
+    }
+    [pscustomobject]@{
+        Service='Exchange Online'; Category='Check access'
+        Label='See which shared mailboxes a user can access'
+        Cmdlet='Get-UserSharedMailboxAccess'; Prompt=@('User')
+        Help='List the shared mailboxes a user has FullAccess to. Scans all shared mailboxes, so it can take a minute on large tenants. Type the person; find / last work.'
+        ParamHelp=@{ User='The person whose shared-mailbox access you want (email or name)' }
+        Project={ param($r)
+            @($r) | ForEach-Object {
+                [pscustomobject]@{ Name = [string]$_.DisplayName; Email = [string]$_.PrimarySmtpAddress; Type = 'Shared mailbox' }
             }
         }
     }
@@ -1267,7 +1298,7 @@ function Start-M365Toolkit {
     Start-Transcript -Path $logFile -Append | Out-Null
     try {
         Write-Host '=====================================================' -ForegroundColor White
-        Write-Host '  Microsoft 365 Guided Command Builder  (v0.12)'       -ForegroundColor White
+        Write-Host '  Microsoft 365 Guided Command Builder  (v0.13)'       -ForegroundColor White
         Write-Host '=====================================================' -ForegroundColor White
 
         $cfg = Get-ToolkitConfig
