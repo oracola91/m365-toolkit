@@ -57,7 +57,9 @@ $Services = @(
         Name        = 'Entra / Identity (Graph)'
         Module      = 'Microsoft.Graph'
         ConnectCmd  = 'Connect-MgGraph'
-        ConnectArgs = { param($Upn) @{ Scopes = 'User.ReadWrite.All','Group.ReadWrite.All' } }
+        # UseDeviceCode: print a URL + code to sign in, instead of auto-opening a
+        # browser (which hangs silently on macOS / pwsh). You authenticate once.
+        ConnectArgs = { param($Upn) @{ Scopes = 'User.ReadWrite.All','Group.ReadWrite.All'; UseDeviceCode = $true } }
         Disconnect  = 'Disconnect-MgGraph'
     }
     [pscustomobject]@{
@@ -94,7 +96,7 @@ $Services = @(
         Module      = 'Microsoft.Graph'
         ConnectCmd  = 'Connect-MgGraph'
         # Same Graph SDK as Entra, but consented for device-management scopes.
-        ConnectArgs = { param($Upn) @{ Scopes = 'DeviceManagementManagedDevices.ReadWrite.All','DeviceManagementConfiguration.ReadWrite.All' } }
+        ConnectArgs = { param($Upn) @{ Scopes = 'DeviceManagementManagedDevices.ReadWrite.All','DeviceManagementConfiguration.ReadWrite.All'; UseDeviceCode = $true } }
         Disconnect  = 'Disconnect-MgGraph'
     }
     [pscustomobject]@{
@@ -1211,7 +1213,7 @@ function Start-M365Toolkit {
     Start-Transcript -Path $logFile -Append | Out-Null
     try {
         Write-Host '=====================================================' -ForegroundColor White
-        Write-Host '  Microsoft 365 Guided Command Builder  (v0.10.1)'     -ForegroundColor White
+        Write-Host '  Microsoft 365 Guided Command Builder  (v0.10.2)'     -ForegroundColor White
         Write-Host '=====================================================' -ForegroundColor White
 
         $cfg = Get-ToolkitConfig
