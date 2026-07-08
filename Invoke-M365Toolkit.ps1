@@ -59,7 +59,7 @@ $Services = @(
         ConnectCmd  = 'Connect-MgGraph'
         # UseDeviceCode: print a URL + code to sign in, instead of auto-opening a
         # browser (which hangs silently on macOS / pwsh). You authenticate once.
-        ConnectArgs = { param($Upn) @{ Scopes = 'User.ReadWrite.All','Group.ReadWrite.All'; UseDeviceCode = $true } }
+        ConnectArgs = { param($Upn) @{ Scopes = 'User.Read.All','GroupMember.Read.All'; UseDeviceCode = $true } }
         Disconnect  = 'Disconnect-MgGraph'
     }
     [pscustomobject]@{
@@ -1213,7 +1213,7 @@ function Start-M365Toolkit {
     Start-Transcript -Path $logFile -Append | Out-Null
     try {
         Write-Host '=====================================================' -ForegroundColor White
-        Write-Host '  Microsoft 365 Guided Command Builder  (v0.10.2)'     -ForegroundColor White
+        Write-Host '  Microsoft 365 Guided Command Builder  (v0.10.3)'     -ForegroundColor White
         Write-Host '=====================================================' -ForegroundColor White
 
         $cfg = Get-ToolkitConfig
