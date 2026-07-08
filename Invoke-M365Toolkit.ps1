@@ -16,7 +16,7 @@
       3. $Actions   - plain-language catalogue: friendly label -> cmdlet.
 
 .NOTES
-    v0.10 - 2026-07-08. Runs on Windows PowerShell 5.1 or PowerShell 7+.
+    v0.11 - 2026-07-08. Runs on Windows PowerShell 5.1 or PowerShell 7+.
     Requires the relevant module installed for whichever service you connect to.
 #>
 
@@ -162,6 +162,36 @@ $Actions = @(
         Cmdlet='Get-MailboxPermission'; Prompt=@('Identity')
         Help='List who can open/manage a mailbox. NOTE: "NT AUTHORITY\SELF" and inherited rows are normal system entries - the real grants are the named users.'
         ParamHelp=@{ Identity='The mailbox to check - whose access list you want to see' }
+    }
+    [pscustomobject]@{
+        Service='Exchange Online'; Category='Check access'
+        Label='See which mail groups a user is in'
+        Cmdlet='Get-Recipient'; Prompt=@('Filter')
+        Preset=@{ ResultSize='Unlimited' }
+        # The user types a person (email/name); the Transform resolves them to a
+        # DistinguishedName and rewrites -Filter into a membership query, so this
+        # lists the distribution / mail-enabled groups that user belongs to.
+        # Uses only Exchange access - no Graph, no admin consent needed.
+        Transform=@{ Filter = { param($v)
+            $rcpt = Get-Recipient -Identity $v -ErrorAction SilentlyContinue | Select-Object -First 1
+            $dn = if ($rcpt) { $rcpt.DistinguishedName } else { $v }
+            "Members -eq '$dn'"
+        } }
+        Help='List the MAIL groups (distribution lists and mail-enabled security groups) a user is a direct member of. Type the person and the tool finds their groups. Note: Microsoft 365 groups and nested membership are not covered by this Exchange filter.'
+        ParamHelp=@{ Filter='The user whose mail groups you want - type their email or name (or find / last). The tool resolves them and looks up their memberships.' }
+        Project={ param($r)
+            @($r) | ForEach-Object {
+                $rt = [string]$_.RecipientTypeDetails
+                $type = switch ($rt) {
+                    'MailUniversalDistributionGroup' { 'Distribution group' }
+                    'MailUniversalSecurityGroup'     { 'Mail-enabled security' }
+                    'DynamicDistributionGroup'       { 'Dynamic distribution group' }
+                    'GroupMailbox'                   { 'Microsoft 365 group' }
+                    default                          { if ($rt) { $rt } else { 'Group' } }
+                }
+                [pscustomobject]@{ Name = [string]$_.DisplayName; Email = [string]$_.PrimarySmtpAddress; Type = $type }
+            }
+        }
     }
     [pscustomobject]@{
         Service='Exchange Online'; Category='Check access'
@@ -347,6 +377,7 @@ $ParamLookup = @{
     Trustee  = $recipientLookup
     Member   = $recipientLookup
     Mailbox  = $recipientLookup
+    Filter   = $recipientLookup   # only "See which mail groups a user is in" prompts -Filter: type a person; its Transform rewrites it into a membership query
     UserId   = @{
         Probe = 'Get-MgUser'
         Run   = {
@@ -1213,7 +1244,7 @@ function Start-M365Toolkit {
     Start-Transcript -Path $logFile -Append | Out-Null
     try {
         Write-Host '=====================================================' -ForegroundColor White
-        Write-Host '  Microsoft 365 Guided Command Builder  (v0.10.3)'     -ForegroundColor White
+        Write-Host '  Microsoft 365 Guided Command Builder  (v0.11)'       -ForegroundColor White
         Write-Host '=====================================================' -ForegroundColor White
 
         $cfg = Get-ToolkitConfig
