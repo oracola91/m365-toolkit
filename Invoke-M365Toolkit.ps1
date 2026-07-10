@@ -16,7 +16,7 @@
       3. $Actions   - plain-language catalogue: friendly label -> cmdlet.
 
 .NOTES
-    v0.13 - 2026-07-08. Runs on Windows PowerShell 5.1 or PowerShell 7+.
+    v0.14 - 2026-07-10. Runs on Windows PowerShell 5.1 or PowerShell 7+.
     Requires the relevant module installed for whichever service you connect to.
 #>
 
@@ -497,7 +497,7 @@ function Get-MenuChoice {
             }
             continue
         }
-        if ($AllowBack -and $raw -eq '0') { return $null }
+        if ($AllowBack -and ($raw -eq '0' -or $raw -eq '')) { return $null }   # Enter = Back, matches Read-Host prompts
         if ($raw -match '^\d+$' -and [int]$raw -ge 1 -and [int]$raw -le $all.Count) {
             return $all[[int]$raw - 1]
         }
@@ -1298,7 +1298,7 @@ function Start-M365Toolkit {
     Start-Transcript -Path $logFile -Append | Out-Null
     try {
         Write-Host '=====================================================' -ForegroundColor White
-        Write-Host '  Microsoft 365 Guided Command Builder  (v0.13)'       -ForegroundColor White
+        Write-Host '  Microsoft 365 Guided Command Builder  (v0.14)'       -ForegroundColor White
         Write-Host '=====================================================' -ForegroundColor White
 
         $cfg = Get-ToolkitConfig
@@ -1363,6 +1363,14 @@ function Start-M365Toolkit {
                 # Escape hatch: drive ANY cmdlet in this connected module by name.
                 if ($cat -eq 'Run any command by name (advanced)') {
                     $cmdName = (Read-Host 'Cmdlet name (e.g. Set-Mailbox), or Enter to cancel').Trim()
+                    if ($cmdName -eq '?') {
+                        Write-Host 'Type the exact cmdlet name from the connected module, e.g. Set-Mailbox, Get-DistributionGroup. Enter alone cancels.' -ForegroundColor White
+                        continue
+                    }
+                    if ($cmdName -and -not (Get-Command -Name $cmdName -ErrorAction SilentlyContinue)) {
+                        Write-Host ("'{0}' is not a command in this session - check the spelling, or make sure the right service is connected." -f $cmdName) -ForegroundColor Yellow
+                        continue
+                    }
                     if ($cmdName) {
                         $mode = Get-MenuChoice -Title "How do you want to run '$cmdName'?" `
                                     -Options @('Run once (type the values now)','Bulk - run for every row in a CSV file') -AllowBack
