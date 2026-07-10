@@ -16,7 +16,7 @@
       3. $Actions   - plain-language catalogue: friendly label -> cmdlet.
 
 .NOTES
-    v0.17 - 2026-07-10. Runs on Windows PowerShell 5.1 or PowerShell 7+.
+    v0.18 - 2026-07-10. Runs on Windows PowerShell 5.1 or PowerShell 7+.
     Requires the relevant module installed for whichever service you connect to.
 #>
 
@@ -582,6 +582,50 @@ function Format-CommandPreview {
 }
 
 # ---------------------------------------------------------------------------
+# Change safety net: for a Set-* cmdlet, read the CURRENT values of the params
+# about to change (via the matching Get-* cmdlet) so the tool can show what is
+# being overwritten and, after the change, print/log an exact command to revert
+# it. Best-effort: returns Supported=$false if it can't map the pair cleanly.
+# ---------------------------------------------------------------------------
+function Get-RevertPlan {
+    param(
+        [Parameter(Mandatory)] [string]    $Cmdlet,
+        [Parameter(Mandatory)] [hashtable] $Bound
+    )
+    $plan = [pscustomobject]@{ Supported = $false; IdName = $null; IdValue = $null; Before = @{} }
+    if ($Cmdlet -notlike 'Set-*') { return $plan }
+    $getCmd = 'Get-' + $Cmdlet.Substring(4)
+    if (-not (Get-Command -Name $getCmd -ErrorAction SilentlyContinue)) { return $plan }
+    $idName = @('Identity','Id','User','Mailbox') | Where-Object { $Bound.Contains($_) } | Select-Object -First 1
+    if (-not $idName) { return $plan }
+    $idVal = $Bound[$idName]
+    $cur = $null
+    try   { $cur = & $getCmd -Identity $idVal -WarningAction SilentlyContinue -ErrorAction Stop | Select-Object -First 1 }
+    catch { try { $cur = & $getCmd $idVal -WarningAction SilentlyContinue -ErrorAction Stop | Select-Object -First 1 } catch { return $plan } }
+    if (-not $cur) { return $plan }
+    $props  = @($cur.PSObject.Properties.Name)
+    $before = @{}
+    foreach ($k in @($Bound.Keys)) {
+        if ($k -eq $idName)           { continue }   # never revert the target itself
+        if ($Bound[$k] -is [switch])  { continue }   # switches aren't a simple before/after value
+        if ($props -contains $k)      { $before[$k] = $cur.$k }
+    }
+    if ($before.Count -eq 0) { return $plan }
+    $plan.Supported = $true; $plan.IdName = $idName; $plan.IdValue = $idVal; $plan.Before = $before
+    return $plan
+}
+
+# Human-readable rendering of a before/after value for the safety display.
+function Format-SafetyValue {
+    param($Value)
+    if ($null -eq $Value) { return '(empty)' }
+    if ($Value -is [array]) { if ($Value.Count -eq 0) { return '(empty)' } else { return (($Value | ForEach-Object { "$_" }) -join ', ') } }
+    $s = "$Value"
+    if ([string]::IsNullOrWhiteSpace($s)) { return '(empty)' }
+    return $s
+}
+
+# ---------------------------------------------------------------------------
 # Shared introspection: read a cmdlet's real parameters and sort them into
 # Required / Optional / Switches (dropping PowerShell's common params). Used by
 # both the guided (one-at-a-time) and bulk (CSV) runners so they stay in sync.
@@ -807,6 +851,17 @@ function Invoke-GuidedCmdlet {
         }
     }
 
+    # ---- Change safety net: for a Set-*, capture what the change overwrites and
+    #      show current -> new so you see exactly what you are about to replace.
+    $revertPlan = Get-RevertPlan -Cmdlet $Cmdlet -Bound $bound
+    if ($revertPlan.Supported) {
+        Write-Host ''
+        Write-Host 'Current value(s) that will change:' -ForegroundColor Yellow
+        foreach ($k in $revertPlan.Before.Keys) {
+            Write-Host ('  {0}:  {1}  ->  {2}' -f $k, (Format-SafetyValue $revertPlan.Before[$k]), (Format-SafetyValue $bound[$k])) -ForegroundColor White
+        }
+    }
+
     # ---- Dry-run preview + final confirm. -----------------------------------
     $preview = Format-CommandPreview -Cmdlet $Cmdlet -BoundParams $bound
     Write-Host ''
@@ -831,6 +886,22 @@ function Invoke-GuidedCmdlet {
     try {
         $result = & $Cmdlet @bound -ErrorAction Stop
         Write-Host 'Done.' -ForegroundColor Green
+        # Change safety net: print + log the exact command to undo this change.
+        if ($revertPlan.Supported) {
+            $rb = @{}; $rb[$revertPlan.IdName] = $revertPlan.IdValue
+            foreach ($k in $revertPlan.Before.Keys) { $rb[$k] = $revertPlan.Before[$k] }
+            $revCmd = Format-CommandPreview -Cmdlet $Cmdlet -BoundParams $rb
+            Write-Host ''
+            Write-Host 'To undo this change, run:' -ForegroundColor Yellow
+            Write-Host ('  ' + $revCmd) -ForegroundColor White
+            try {
+                $undoDir = Join-Path $script:ToolkitHome 'logs'
+                if (-not (Test-Path $undoDir)) { New-Item -ItemType Directory -Path $undoDir | Out-Null }
+                $undoFile = Join-Path $undoDir 'undo-hints.log'
+                Add-Content -Path $undoFile -Value ('{0}  {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $revCmd)
+                Write-Host ('  (also saved to {0})' -f $undoFile) -ForegroundColor White
+            } catch {}
+        }
         # Optional per-action projection: reshape a raw/cluttered result into clean,
         # readable columns (e.g. flatten Get-MgUserMemberOf into Name/Email/Type)
         # before it is shown AND before it becomes the pipe source for 'last'.
@@ -1338,7 +1409,7 @@ function Start-M365Toolkit {
     Start-Transcript -Path $logFile -Append | Out-Null
     try {
         Write-Host '=====================================================' -ForegroundColor White
-        Write-Host '  Microsoft 365 Guided Command Builder  (v0.17)'       -ForegroundColor White
+        Write-Host '  Microsoft 365 Guided Command Builder  (v0.18)'       -ForegroundColor White
         Write-Host '=====================================================' -ForegroundColor White
 
         $cfg = Get-ToolkitConfig
