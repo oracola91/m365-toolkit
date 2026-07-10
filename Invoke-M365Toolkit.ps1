@@ -16,7 +16,7 @@
       3. $Actions   - plain-language catalogue: friendly label -> cmdlet.
 
 .NOTES
-    v0.14 - 2026-07-10. Runs on Windows PowerShell 5.1 or PowerShell 7+.
+    v0.15 - 2026-07-10. Runs on Windows PowerShell 5.1 or PowerShell 7+.
     Requires the relevant module installed for whichever service you connect to.
 #>
 
@@ -712,7 +712,18 @@ function Invoke-GuidedCmdlet {
 
     # ---- Remaining optional params: offer the list, let the user pick which to set.
     $optRest = @($optional | Where-Object { -not $bound.Contains($_.Name) })
-    if ($optRest.Count -gt 0) {
+    if ($optRest.Count -eq 1 -and $ParamLookup.ContainsKey($optRest[0].Name)) {
+        # Single identity-like optional field (e.g. Get-*Configuration -Identity):
+        # skip the "which numbers do you want to set?" step and ask for its value directly.
+        $p = $optRest[0]
+        Write-Host ''
+        Write-Host ("Optional: {0} - enter it now, or press Enter to skip." -f $p.Name) -ForegroundColor White
+        $desc = Get-ParamDescription -Name $p.Name -ParamHelp $ParamHelp -Cmdlet $Cmdlet
+        $v = Read-ParameterValue -Param $p -Description $desc -Hints $Hints
+        if ($script:ParamBack -or $script:ParamCancel) { Write-Host 'Cancelled - back to the menu (nothing was run).' -ForegroundColor White; return }
+        if ($null -ne $v) { $bound[$p.Name] = $v }
+    }
+    elseif ($optRest.Count -gt 0) {
         Write-Host ''
         Write-Host 'Optional parameters you can set:' -ForegroundColor White
         for ($i = 0; $i -lt $optRest.Count; $i++) {
@@ -1204,8 +1215,8 @@ function Show-Result {
             'Done'
         )
         switch ($choice) {
-            'Show as a table'                        { $items | Format-Table -AutoSize | Out-Host }
-            'Show a table with only columns I choose' { $c = Select-ResultColumns -Items $items; if ($c) { $items | Select-Object $c | Format-Table -AutoSize | Out-Host } }
+            'Show as a table'                        { if (@($items).Count -eq 1) { $items | Format-List | Out-Host } else { $items | Format-Table -AutoSize -Wrap | Out-Host } }
+            'Show a table with only columns I choose' { $c = Select-ResultColumns -Items $items; if ($c) { $items | Select-Object $c | Format-Table -AutoSize -Wrap | Out-Host } }
             'Save all columns to a CSV file'          { Save-ResultCsv -Items $items -Cmdlet $Cmdlet }
             'Save only columns I choose to a CSV file' { $c = Select-ResultColumns -Items $items; if ($c) { Save-ResultCsv -Items ($items | Select-Object $c) -Cmdlet $Cmdlet } }
             default { return }
@@ -1298,7 +1309,7 @@ function Start-M365Toolkit {
     Start-Transcript -Path $logFile -Append | Out-Null
     try {
         Write-Host '=====================================================' -ForegroundColor White
-        Write-Host '  Microsoft 365 Guided Command Builder  (v0.14)'       -ForegroundColor White
+        Write-Host '  Microsoft 365 Guided Command Builder  (v0.15)'       -ForegroundColor White
         Write-Host '=====================================================' -ForegroundColor White
 
         $cfg = Get-ToolkitConfig
@@ -1366,18 +1377,25 @@ function Start-M365Toolkit {
                     # an unknown name is rejected and re-asks, Enter alone cancels to the menu.
                     $cmdName = $null
                     while ($true) {
-                        $entry = (Read-Host 'Cmdlet name (e.g. Set-Mailbox), or Enter to cancel').Trim()
+                        $entry = (Read-Host 'Cmdlet name or keyword to search (e.g. Set-Mailbox, or "calendar"), Enter to cancel').Trim()
                         if (-not $entry) { break }
                         if ($entry -eq '?') {
-                            Write-Host 'Type the exact cmdlet name from the connected module, e.g. Set-Mailbox, Get-DistributionGroup. Enter alone cancels.' -ForegroundColor White
+                            Write-Host 'Type a full cmdlet name (e.g. Set-Mailbox) to use it directly, or part of a name (e.g. calendar) to pick from matching commands. Enter alone cancels.' -ForegroundColor White
                             continue
                         }
-                        if (-not (Get-Command -Name $entry -ErrorAction SilentlyContinue)) {
-                            Write-Host ("'{0}' is not a command in this session - check the spelling, or make sure the right service is connected." -f $entry) -ForegroundColor Yellow
+                        if (Get-Command -Name $entry -ErrorAction SilentlyContinue) { $cmdName = $entry; break }   # exact name -> use it
+                        # Not an exact command: treat the text as a keyword and offer a picker of matches.
+                        $hits = @(Get-Command -CommandType Cmdlet,Function -Name "*$entry*" -ErrorAction SilentlyContinue | Sort-Object Name)
+                        if ($hits.Count -eq 0) {
+                            Write-Host ("Nothing matches '{0}' in this session - check the spelling, or make sure the right service is connected." -f $entry) -ForegroundColor Yellow
                             continue
                         }
-                        $cmdName = $entry
-                        break
+                        if ($hits.Count -gt 40) {
+                            Write-Host ("'{0}' matches {1} commands - type more of the name to narrow it down." -f $entry, $hits.Count) -ForegroundColor Yellow
+                            continue
+                        }
+                        $picked = Get-MenuChoice -Title ("Commands matching '{0}':" -f $entry) -Options @($hits.Name) -AllowBack
+                        if ($picked) { $cmdName = $picked; break }   # 0 / Enter = Back -> ask for a name again
                     }
                     if ($cmdName) {
                         $mode = Get-MenuChoice -Title "How do you want to run '$cmdName'?" `
