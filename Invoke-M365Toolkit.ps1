@@ -1362,14 +1362,22 @@ function Start-M365Toolkit {
 
                 # Escape hatch: drive ANY cmdlet in this connected module by name.
                 if ($cat -eq 'Run any command by name (advanced)') {
-                    $cmdName = (Read-Host 'Cmdlet name (e.g. Set-Mailbox), or Enter to cancel').Trim()
-                    if ($cmdName -eq '?') {
-                        Write-Host 'Type the exact cmdlet name from the connected module, e.g. Set-Mailbox, Get-DistributionGroup. Enter alone cancels.' -ForegroundColor White
-                        continue
-                    }
-                    if ($cmdName -and -not (Get-Command -Name $cmdName -ErrorAction SilentlyContinue)) {
-                        Write-Host ("'{0}' is not a command in this session - check the spelling, or make sure the right service is connected." -f $cmdName) -ForegroundColor Yellow
-                        continue
+                    # Ask for a cmdlet name, staying on this prompt: ? shows help and re-asks,
+                    # an unknown name is rejected and re-asks, Enter alone cancels to the menu.
+                    $cmdName = $null
+                    while ($true) {
+                        $entry = (Read-Host 'Cmdlet name (e.g. Set-Mailbox), or Enter to cancel').Trim()
+                        if (-not $entry) { break }
+                        if ($entry -eq '?') {
+                            Write-Host 'Type the exact cmdlet name from the connected module, e.g. Set-Mailbox, Get-DistributionGroup. Enter alone cancels.' -ForegroundColor White
+                            continue
+                        }
+                        if (-not (Get-Command -Name $entry -ErrorAction SilentlyContinue)) {
+                            Write-Host ("'{0}' is not a command in this session - check the spelling, or make sure the right service is connected." -f $entry) -ForegroundColor Yellow
+                            continue
+                        }
+                        $cmdName = $entry
+                        break
                     }
                     if ($cmdName) {
                         $mode = Get-MenuChoice -Title "How do you want to run '$cmdName'?" `
