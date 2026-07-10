@@ -16,7 +16,7 @@
       3. $Actions   - plain-language catalogue: friendly label -> cmdlet.
 
 .NOTES
-    v0.15 - 2026-07-10. Runs on Windows PowerShell 5.1 or PowerShell 7+.
+    v0.16 - 2026-07-10. Runs on Windows PowerShell 5.1 or PowerShell 7+.
     Requires the relevant module installed for whichever service you connect to.
 #>
 
@@ -1302,6 +1302,14 @@ function Start-M365Toolkit {
     $script:LastResult = @()
     $script:LastResultCmdlet = $null
 
+    # Snapshot the commands that exist BEFORE connecting to any service (core
+    # PowerShell + this toolkit's own functions). After a service connects, its
+    # cmdlets are whatever appeared on top of this baseline - a module-agnostic
+    # way to list a service's commands (EXO v3 loads its data cmdlets into a
+    # dynamically-named temp module, so filtering by module name would miss them).
+    $script:BaselineCommands = @(Get-Command -CommandType Cmdlet,Function -ErrorAction SilentlyContinue |
+                                    Select-Object -ExpandProperty Name -Unique)
+
     $logDir = Join-Path $script:ToolkitHome 'logs'
     if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out-Null }
     $stamp  = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -1309,7 +1317,7 @@ function Start-M365Toolkit {
     Start-Transcript -Path $logFile -Append | Out-Null
     try {
         Write-Host '=====================================================' -ForegroundColor White
-        Write-Host '  Microsoft 365 Guided Command Builder  (v0.15)'       -ForegroundColor White
+        Write-Host '  Microsoft 365 Guided Command Builder  (v0.16)'       -ForegroundColor White
         Write-Host '=====================================================' -ForegroundColor White
 
         $cfg = Get-ToolkitConfig
@@ -1373,29 +1381,46 @@ function Start-M365Toolkit {
 
                 # Escape hatch: drive ANY cmdlet in this connected module by name.
                 if ($cat -eq 'Run any command by name (advanced)') {
-                    # Ask for a cmdlet name, staying on this prompt: ? shows help and re-asks,
-                    # an unknown name is rejected and re-asks, Enter alone cancels to the menu.
+                    # Browse the connected service's commands with NO typing: pick a verb
+                    # (Get / Set / New ...), then pick the command. "Type a name or keyword"
+                    # stays available for people who know the name. Commands are scoped to
+                    # whatever this service added on top of the pre-connect baseline.
+                    $svcCmds = @(Get-Command -CommandType Cmdlet,Function -ErrorAction SilentlyContinue |
+                                    Where-Object { $script:BaselineCommands -notcontains $_.Name })
+                    if ($svcCmds.Count -eq 0) {   # e.g. Graph loads sub-modules on demand - fall back to everything
+                        $svcCmds = @(Get-Command -CommandType Cmdlet,Function -ErrorAction SilentlyContinue)
+                    }
+                    $verbs = @($svcCmds | ForEach-Object { $_.Verb } | Where-Object { $_ } | Sort-Object -Unique)
                     $cmdName = $null
-                    while ($true) {
-                        $entry = (Read-Host 'Cmdlet name or keyword to search (e.g. Set-Mailbox, or "calendar"), Enter to cancel').Trim()
-                        if (-not $entry) { break }
-                        if ($entry -eq '?') {
-                            Write-Host 'Type a full cmdlet name (e.g. Set-Mailbox) to use it directly, or part of a name (e.g. calendar) to pick from matching commands. Enter alone cancels.' -ForegroundColor White
-                            continue
+                    while (-not $cmdName) {
+                        $verb = Get-MenuChoice -Title 'Pick a verb (what do you want to do?)' `
+                                    -Options $verbs -ExtraOptions @('Type a name or keyword instead') -AllowBack
+                        if (-not $verb) { break }   # 0 / Enter = Back -> leave the advanced path
+                        if ($verb -eq 'Type a name or keyword instead') {
+                            while ($true) {
+                                $entry = (Read-Host 'Cmdlet name or keyword (Enter to go back)').Trim()
+                                if (-not $entry) { break }
+                                if ($entry -eq '?') { Write-Host 'Type a full cmdlet name to use it, or part of a name to pick from matches.' -ForegroundColor White; continue }
+                                if (Get-Command -Name $entry -ErrorAction SilentlyContinue) { $cmdName = $entry; break }
+                                $hits = @($svcCmds | Where-Object { $_.Name -like "*$entry*" } | Select-Object -ExpandProperty Name | Sort-Object)
+                                if ($hits.Count -eq 0)  { Write-Host ("Nothing matches '{0}'." -f $entry) -ForegroundColor Yellow; continue }
+                                if ($hits.Count -gt 40) { Write-Host ("'{0}' matches {1} commands - narrow it down." -f $entry, $hits.Count) -ForegroundColor Yellow; continue }
+                                $p = Get-MenuChoice -Title ("Commands matching '{0}':" -f $entry) -Options $hits -AllowBack
+                                if ($p) { $cmdName = $p; break }
+                            }
+                            continue   # got a name -> loop exits; otherwise back to the verb menu
                         }
-                        if (Get-Command -Name $entry -ErrorAction SilentlyContinue) { $cmdName = $entry; break }   # exact name -> use it
-                        # Not an exact command: treat the text as a keyword and offer a picker of matches.
-                        $hits = @(Get-Command -CommandType Cmdlet,Function -Name "*$entry*" -ErrorAction SilentlyContinue | Sort-Object Name)
-                        if ($hits.Count -eq 0) {
-                            Write-Host ("Nothing matches '{0}' in this session - check the spelling, or make sure the right service is connected." -f $entry) -ForegroundColor Yellow
-                            continue
+                        # A verb was chosen: list its commands (nouns), filtering first if long.
+                        $inVerb = @($svcCmds | Where-Object { $_.Verb -eq $verb } | Select-Object -ExpandProperty Name | Sort-Object)
+                        if ($inVerb.Count -gt 40) {
+                            $kw = (Read-Host ("  {0}- has {1} commands - type part of the name to filter, or Enter to list all" -f $verb, $inVerb.Count)).Trim()
+                            if ($kw) {
+                                $inVerb = @($inVerb | Where-Object { $_ -like "*$kw*" })
+                                if ($inVerb.Count -eq 0) { Write-Host '  Nothing matched - pick another verb.' -ForegroundColor Yellow; continue }
+                            }
                         }
-                        if ($hits.Count -gt 40) {
-                            Write-Host ("'{0}' matches {1} commands - type more of the name to narrow it down." -f $entry, $hits.Count) -ForegroundColor Yellow
-                            continue
-                        }
-                        $picked = Get-MenuChoice -Title ("Commands matching '{0}':" -f $entry) -Options @($hits.Name) -AllowBack
-                        if ($picked) { $cmdName = $picked; break }   # 0 / Enter = Back -> ask for a name again
+                        $picked = Get-MenuChoice -Title ("{0} commands:" -f $verb) -Options $inVerb -AllowBack
+                        if ($picked) { $cmdName = $picked }   # else 0/Enter = Back -> re-pick a verb
                     }
                     if ($cmdName) {
                         $mode = Get-MenuChoice -Title "How do you want to run '$cmdName'?" `
