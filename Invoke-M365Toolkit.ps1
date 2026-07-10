@@ -16,7 +16,7 @@
       3. $Actions   - plain-language catalogue: friendly label -> cmdlet.
 
 .NOTES
-    v0.16 - 2026-07-10. Runs on Windows PowerShell 5.1 or PowerShell 7+.
+    v0.17 - 2026-07-10. Runs on Windows PowerShell 5.1 or PowerShell 7+.
     Requires the relevant module installed for whichever service you connect to.
 #>
 
@@ -475,8 +475,29 @@ function Get-MenuChoice {
     $all = @($Options) + @($ExtraOptions)   # combined for selection; numbering runs continuously
     Write-Host ''
     Write-Host $Title -ForegroundColor White
-    for ($i = 0; $i -lt $Options.Count; $i++) {
-        Write-Host ('  {0,2}. {1}' -f ($i + 1), $Options[$i])
+    # Render the options. Short lists stay single-column; long ones (e.g. the
+    # verb / cmdlet pickers) flow into as many columns as the window is wide,
+    # so they don't stretch far down the screen. Numbering is left-to-right,
+    # top-to-bottom, and the selection mapping is unchanged (pick by number).
+    $labels = @(for ($i = 0; $i -lt $Options.Count; $i++) { '{0,3}. {1}' -f ($i + 1), $Options[$i] })
+    $cols = 1
+    if ($Options.Count -gt 12) {
+        $winW = 80
+        try { $w = $Host.UI.RawUI.WindowSize.Width; if ($w -gt 20) { $winW = $w } } catch {}
+        $colW = (($labels | Measure-Object -Property Length -Maximum).Maximum) + 3
+        $cols = [Math]::Max(1, [Math]::Floor(($winW - 2) / $colW))
+        $rowsN = [Math]::Ceiling($Options.Count / $cols)
+        for ($r = 0; $r -lt $rowsN; $r++) {
+            $line = ''
+            for ($c = 0; $c -lt $cols; $c++) {
+                $idx = $r * $cols + $c
+                if ($idx -lt $labels.Count) { $line += $labels[$idx].PadRight($colW) }
+            }
+            Write-Host ('  ' + $line.TrimEnd())
+        }
+    }
+    if ($cols -eq 1) {
+        foreach ($lbl in $labels) { Write-Host ('  ' + $lbl) }
     }
     if ($ExtraOptions) {
         # App-level controls, kept separate from the menu's own items.
@@ -1317,7 +1338,7 @@ function Start-M365Toolkit {
     Start-Transcript -Path $logFile -Append | Out-Null
     try {
         Write-Host '=====================================================' -ForegroundColor White
-        Write-Host '  Microsoft 365 Guided Command Builder  (v0.16)'       -ForegroundColor White
+        Write-Host '  Microsoft 365 Guided Command Builder  (v0.17)'       -ForegroundColor White
         Write-Host '=====================================================' -ForegroundColor White
 
         $cfg = Get-ToolkitConfig
@@ -1354,8 +1375,8 @@ function Start-M365Toolkit {
 
                 $categories = @($svcActions.Category | Select-Object -Unique | Sort-Object)   # A-Z; fixed items appended after
                 $cat = Get-MenuChoice -Title "[$svcName] Choose a category" `
-                            -Options @($categories) `
-                            -ExtraOptions @('Search actions by keyword','Run any command by name (advanced)','Switch service') -AllowBack
+                            -Options (@($categories) + @('Run any command by name (advanced)')) `
+                            -ExtraOptions @('Search actions by keyword','Switch service') -AllowBack
                 if (-not $cat -or $cat -eq 'Switch service') { break }
 
                 # Keyword search across this service's actions (name / cmdlet / category).
