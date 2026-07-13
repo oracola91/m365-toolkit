@@ -194,7 +194,10 @@ $Actions = @(
         Transform=@{ Filter = { param($v)
             $rcpt = Get-Recipient -Identity $v -ErrorAction SilentlyContinue | Select-Object -First 1
             $dn = if ($rcpt) { $rcpt.DistinguishedName } else { $v }
-            "Members -eq '$dn'"
+            # Escape single quotes ('->'') so names like O'Brien don't break the
+            # OPATH filter or allow filter injection.
+            $dnEsc = "$dn".Replace("'","''")
+            "Members -eq '$dnEsc'"
         } }
         Help='List the MAIL groups (distribution lists and mail-enabled security groups) a user is a direct member of. Type the person and the tool finds their groups. Note: Microsoft 365 groups and nested membership are not covered by this Exchange filter.'
         ParamHelp=@{ Filter='The user whose mail groups you want - type their email or name (or find / last). The tool resolves them and looks up their memberships.' }
@@ -419,7 +422,8 @@ $recipientLookup = @{
     Probe = 'Get-EXORecipient'
     Run   = {
         param($term)
-        Get-EXORecipient -ResultSize 25 -Filter "DisplayName -like '*$term*' -or PrimarySmtpAddress -like '*$term*'" -ErrorAction Stop |
+        $t = "$term".Replace("'","''")   # escape quotes so O'Brien-type names can't break/inject the OPATH filter
+        Get-EXORecipient -ResultSize 25 -Filter "DisplayName -like '*$t*' -or PrimarySmtpAddress -like '*$t*'" -ErrorAction Stop |
             ForEach-Object { [pscustomobject]@{ Display = ('{0}  <{1}>  [{2}]' -f $_.DisplayName, $_.PrimarySmtpAddress, $_.RecipientTypeDetails); Value = [string]$_.PrimarySmtpAddress } }
     }
     # Resolve an EXACT typed value to a real recipient (or $null if it doesn't exist).
@@ -436,7 +440,8 @@ $ParamLookup = @{
         Probe = 'Get-MgUser'
         Run   = {
             param($term)
-            Get-MgUser -Filter "startswith(displayName,'$term') or startswith(mail,'$term') or startswith(userPrincipalName,'$term')" -Top 25 -ErrorAction Stop |
+            $t = "$term".Replace("'","''")   # escape quotes so O'Brien-type names can't break/inject the OData filter
+            Get-MgUser -Filter "startswith(displayName,'$t') or startswith(mail,'$t') or startswith(userPrincipalName,'$t')" -Top 25 -ErrorAction Stop |
                 ForEach-Object { [pscustomobject]@{ Display = ('{0}  <{1}>' -f $_.DisplayName, $_.UserPrincipalName); Value = [string]$_.UserPrincipalName } }
         }
         Resolve = { param($v) Get-MgUser -UserId $v -ErrorAction SilentlyContinue }
@@ -459,6 +464,13 @@ $ParamDocs = @{
     Deny            = 'Creates a DENY entry - blocks the right instead of granting it. Leave off for a normal grant.'
     GroupMailbox    = 'Allow this to target a Microsoft 365 Group mailbox (normally blocked). Rarely needed.'
     IgnoreDefaultScope = 'Search the whole tenant instead of the session''s default scope when resolving the mailbox. Advanced - only if a lookup fails due to scope.'
+}
+
+# True only when input is redirected (piped) AND exhausted. Used to break out of
+# prompt loops that would otherwise spin forever on a closed stdin (e.g. the tool
+# was run non-interactively). Always false for a normal interactive terminal.
+function Test-InputEnded {
+    try { return ([Console]::IsInputRedirected -and [Console]::In.Peek() -lt 0) } catch { return $false }
 }
 
 # ---------------------------------------------------------------------------
@@ -509,6 +521,7 @@ function Get-MenuChoice {
     if ($AllowBack) { Write-Host '   0. Back' -ForegroundColor White }
     if ($Descriptions) { Write-Host '   (type ? for a short explanation of each choice)' -ForegroundColor White }
     while ($true) {
+        if (Test-InputEnded) { throw [System.IO.EndOfStreamException]::new('No more input (stdin closed).') }
         $raw = Read-Host 'Choose a number'
         if ($raw -eq '?' -and $Descriptions) {
             for ($i = 0; $i -lt $Options.Count; $i++) {
@@ -551,7 +564,17 @@ function Connect-M365Service {
     try { Import-Module $Service.Module -ErrorAction SilentlyContinue -WarningAction SilentlyContinue 2>$null } catch { }
     $connectArgs = & $Service.ConnectArgs $Upn
     Write-Host ("Connecting to {0} as {1} ..." -f $Service.Name, $Upn) -ForegroundColor White
-    & $Service.ConnectCmd @connectArgs
+    # Pause the transcript across the sign-in so a device code / interactive secret
+    # is never written to the on-disk log, then resume (append) to the same file.
+    $transcriptPaused = $false
+    try { Stop-Transcript | Out-Null; $transcriptPaused = $true } catch { }
+    try {
+        & $Service.ConnectCmd @connectArgs
+    } finally {
+        if ($transcriptPaused -and $script:LogFile) {
+            try { Start-Transcript -Path $script:LogFile -Append | Out-Null } catch { }
+        }
+    }
     Write-Host ("Connected to {0}." -f $Service.Name) -ForegroundColor Green
 }
 
@@ -560,8 +583,8 @@ function Connect-M365Service {
 # ---------------------------------------------------------------------------
 function Format-CommandPreview {
     param(
-        [Parameter(Mandatory)] [string]    $Cmdlet,
-        [Parameter(Mandatory)] [hashtable] $BoundParams
+        [Parameter(Mandatory)] [string]                       $Cmdlet,
+        [Parameter(Mandatory)] [System.Collections.IDictionary] $BoundParams   # IDictionary (not [hashtable]) so an [ordered] dict keeps its insertion order
     )
     $sb = [System.Text.StringBuilder]::new($Cmdlet)
     foreach ($key in $BoundParams.Keys) {
@@ -592,26 +615,50 @@ function Get-RevertPlan {
         [Parameter(Mandatory)] [string]    $Cmdlet,
         [Parameter(Mandatory)] [hashtable] $Bound
     )
-    $plan = [pscustomobject]@{ Supported = $false; IdName = $null; IdValue = $null; Before = @{} }
+    $plan = [pscustomobject]@{ Supported = $false; Keys = @{}; Before = @{} }
     if ($Cmdlet -notlike 'Set-*') { return $plan }
     $getCmd = 'Get-' + $Cmdlet.Substring(4)
-    if (-not (Get-Command -Name $getCmd -ErrorAction SilentlyContinue)) { return $plan }
-    $idName = @('Identity','Id','User','Mailbox') | Where-Object { $Bound.Contains($_) } | Select-Object -First 1
-    if (-not $idName) { return $plan }
-    $idVal = $Bound[$idName]
+    $getCommand = Get-Command -Name $getCmd -ErrorAction SilentlyContinue
+    if (-not $getCommand) { return $plan }
+
+    # A record may be located by a COMPOUND key. Set-MailboxFolderPermission, for
+    # example, is keyed by Identity (the calendar) AND User (whose entry) - reading
+    # only Identity returns EVERY entry on the calendar and Select -First 1 grabs
+    # the Default row, so the "before" and the undo would silently target Default
+    # instead of the user we changed. Capture ALL bound key params and query with
+    # every one the Get- cmdlet accepts, so we read the single matching record.
+    $keyNames = @(@('Identity','Id','User','Mailbox') | Where-Object { $Bound.Contains($_) })
+    if ($keyNames.Count -eq 0) { return $plan }
+    $getParams = @{}
+    $getParamNames = @($getCommand.Parameters.Keys)   # null-safe: empty array if Parameters is null
+    foreach ($k in $keyNames) {
+        if ($getParamNames -contains $k) { $getParams[$k] = $Bound[$k] }
+    }
     $cur = $null
-    try   { $cur = & $getCmd -Identity $idVal -WarningAction SilentlyContinue -ErrorAction Stop | Select-Object -First 1 }
-    catch { try { $cur = & $getCmd $idVal -WarningAction SilentlyContinue -ErrorAction Stop | Select-Object -First 1 } catch { return $plan } }
+    try {
+        $cur = & $getCmd @getParams -WarningAction SilentlyContinue -ErrorAction Stop | Select-Object -First 1
+    } catch {
+        # Positional fallback only for a SINGLE key - for a compound key a lone
+        # positional value would match the wrong record (e.g. Default), so we
+        # decline the undo entirely rather than generate a corrupting one.
+        if ($keyNames.Count -eq 1) {
+            try { $cur = & $getCmd $Bound[$keyNames[0]] -WarningAction SilentlyContinue -ErrorAction Stop | Select-Object -First 1 } catch { return $plan }
+        } else { return $plan }
+    }
     if (-not $cur) { return $plan }
     $props  = @($cur.PSObject.Properties.Name)
     $before = @{}
     foreach ($k in @($Bound.Keys)) {
-        if ($k -eq $idName)           { continue }   # never revert the target itself
+        if ($keyNames -contains $k)   { continue }   # keys locate the record; they are replayed verbatim, never reverted
         if ($Bound[$k] -is [switch])  { continue }   # switches aren't a simple before/after value
         if ($props -contains $k)      { $before[$k] = $cur.$k }
     }
     if ($before.Count -eq 0) { return $plan }
-    $plan.Supported = $true; $plan.IdName = $idName; $plan.IdValue = $idVal; $plan.Before = $before
+    # Replay the exact key values the user typed (clean, bindable) - not $cur's
+    # key properties, which are display objects that may not re-bind.
+    $keys = @{}
+    foreach ($k in $keyNames) { $keys[$k] = $Bound[$k] }
+    $plan.Supported = $true; $plan.Keys = $keys; $plan.Before = $before
     return $plan
 }
 
@@ -735,7 +782,13 @@ function Invoke-GuidedCmdlet {
     #      mailbox, -Type Shared to convert). Bound automatically, shown in the
     #      preview, never prompted for.
     if ($Preset) {
-        foreach ($k in $Preset.Keys) { $bound[$k] = $Preset[$k] }
+        foreach ($k in $Preset.Keys) {
+            $pv = $Preset[$k]
+            # A switch preset written as $true should bind and preview as a switch
+            # (-Shared), not as -Shared $true. Coerce bool -> switch for switch params.
+            if ($pv -is [bool] -and ($switches.Name -contains $k)) { $pv = [switch]$pv }
+            $bound[$k] = $pv
+        }
         Write-Host ('  Fixed by this action: ' + (($Preset.Keys | ForEach-Object { "-$_ $($Preset[$_])" }) -join ', ')) -ForegroundColor White
     }
     $promptList = @($Prompt)   # params to always walk, even if optional
@@ -771,8 +824,9 @@ function Invoke-GuidedCmdlet {
     foreach ($p in ($optional | Where-Object { $promptList -contains $_.Name -and -not $bound.Contains($_.Name) })) {
         $desc = Get-ParamDescription -Name $p.Name -ParamHelp $ParamHelp -Cmdlet $Cmdlet
         $v = Read-ParameterValue -Param $p -Description $desc -Hints $Hints
-        if ($script:ParamBack -or $script:ParamCancel) { Write-Host 'Cancelled - back to the menu (nothing was run).' -ForegroundColor White; return }
-        if ($null -ne $v) { $bound[$p.Name] = $v }
+        # 'cancel' aborts the whole action; 'back' on an OPTIONAL field just skips it.
+        if ($script:ParamCancel) { Write-Host 'Cancelled - back to the menu (nothing was run).' -ForegroundColor White; return }
+        if (-not $script:ParamBack -and $null -ne $v) { $bound[$p.Name] = $v }
     }
 
     # ---- Remaining optional params: offer the list, let the user pick which to set.
@@ -785,8 +839,9 @@ function Invoke-GuidedCmdlet {
         Write-Host ("Optional: {0} - enter it now, or press Enter to skip." -f $p.Name) -ForegroundColor White
         $desc = Get-ParamDescription -Name $p.Name -ParamHelp $ParamHelp -Cmdlet $Cmdlet
         $v = Read-ParameterValue -Param $p -Description $desc -Hints $Hints
-        if ($script:ParamBack -or $script:ParamCancel) { Write-Host 'Cancelled - back to the menu (nothing was run).' -ForegroundColor White; return }
-        if ($null -ne $v) { $bound[$p.Name] = $v }
+        # 'cancel' aborts the whole action; 'back' on an OPTIONAL field just skips it.
+        if ($script:ParamCancel) { Write-Host 'Cancelled - back to the menu (nothing was run).' -ForegroundColor White; return }
+        if (-not $script:ParamBack -and $null -ne $v) { $bound[$p.Name] = $v }
     }
     elseif ($optRest.Count -gt 0) {
         Write-Host ''
@@ -810,8 +865,10 @@ function Invoke-GuidedCmdlet {
             if ($idx -ge 0 -and $idx -lt $optRest.Count) {
                 $p = $optRest[$idx]
                 $desc = Get-ParamDescription -Name $p.Name -ParamHelp $ParamHelp -Cmdlet $Cmdlet
-                $bound[$p.Name] = Read-ParameterValue -Param $p -Description $desc -Hints $Hints
-                if ($script:ParamBack -or $script:ParamCancel) { Write-Host 'Cancelled - back to the menu (nothing was run).' -ForegroundColor White; return }
+                $v = Read-ParameterValue -Param $p -Description $desc -Hints $Hints
+                # 'cancel' aborts the whole action; 'back' just skips this optional pick.
+                if ($script:ParamCancel) { Write-Host 'Cancelled - back to the menu (nothing was run).' -ForegroundColor White; return }
+                if (-not $script:ParamBack -and $null -ne $v) { $bound[$p.Name] = $v }
             }
         }
     }
@@ -837,7 +894,7 @@ function Invoke-GuidedCmdlet {
         }
         foreach ($n in ($pick -split '[,\s]+' | Where-Object { $_ -match '^\d+$' })) {
             $idx = [int]$n - 1
-            if ($idx -ge 0 -and $idx -lt $swRest.Count) { $bound[$swRest[$idx].Name] = $true }
+            if ($idx -ge 0 -and $idx -lt $swRest.Count) { $bound[$swRest[$idx].Name] = [switch]$true }   # [switch] so preview shows -Force, not -Force $true
         }
     }
 
@@ -877,7 +934,20 @@ function Invoke-GuidedCmdlet {
     Write-Host ''
     Write-Host 'FINAL CONFIRMATION - about to execute this command:' -ForegroundColor Yellow
     Write-Host ('  ' + $preview) -ForegroundColor White
-    if ((Read-Host 'Execute it now? (y/n)') -notmatch '^(y|yes)$') {
+    # Destructive cmdlets have no automatic undo (the safety net only covers Set-*),
+    # and any cmdlet can reach this point via "Run any command". Demand a deliberate
+    # typed confirmation for destructive verbs instead of a one-key y.
+    $destructiveVerbs = @('Remove','Disable','Delete','Reset','Clear','Revoke','Uninstall','Deprovision')
+    $verb = ($Cmdlet -split '-',2)[0]
+    if ($destructiveVerbs -contains $verb) {
+        Write-Host ''
+        Write-Host ('[!] {0} is DESTRUCTIVE and has no automatic undo.' -f $Cmdlet) -ForegroundColor Red
+        $typed = (Read-Host ('To proceed, type the command name exactly ({0}) - anything else cancels' -f $Cmdlet)).Trim()
+        if ($typed -ne $Cmdlet) {
+            Write-Host 'Cancelled - nothing was run.' -ForegroundColor White
+            return
+        }
+    } elseif ((Read-Host 'Execute it now? (y/n)') -notmatch '^(y|yes)$') {
         Write-Host 'Cancelled - nothing was run.' -ForegroundColor White
         return
     }
@@ -888,7 +958,8 @@ function Invoke-GuidedCmdlet {
         Write-Host 'Done.' -ForegroundColor Green
         # Change safety net: print + log the exact command to undo this change.
         if ($revertPlan.Supported) {
-            $rb = @{}; $rb[$revertPlan.IdName] = $revertPlan.IdValue
+            $rb = [ordered]@{}
+            foreach ($k in $revertPlan.Keys.Keys)   { $rb[$k] = $revertPlan.Keys[$k] }
             foreach ($k in $revertPlan.Before.Keys) { $rb[$k] = $revertPlan.Before[$k] }
             $revCmd = Format-CommandPreview -Cmdlet $Cmdlet -BoundParams $rb
             Write-Host ''
@@ -926,6 +997,7 @@ function Invoke-BulkCmdlet {
         [string[]]  $Prompt,
         [hashtable] $ParamHelp,
         [hashtable] $Preset,
+        [hashtable] $Hints,      # optional per-action allowed-value overrides (name -> values)
         [hashtable] $Transform   # optional post-processing of each row's values (name -> scriptblock)
     )
     $cmd   = Get-Command $Cmdlet -ErrorAction Stop
@@ -950,13 +1022,31 @@ function Invoke-BulkCmdlet {
         if ($map.Contains($p.Name)) { return }
         $desc = if ($ParamHelp) { $ParamHelp[$p.Name] } else { $null }
         if ($desc) { Write-Host ("  -> {0}" -f $desc) -ForegroundColor White }
+        # Allowed-value set (ValidateSet / enum / per-action Hints / global ParamHints),
+        # mirroring the guided prompt: shown to the user and used to validate =fixed values.
+        $type = $p.ParameterType; $elem = if ($type.IsArray) { $type.GetElementType() } else { $type }
+        $allowed = $null
+        $vset = $p.Attributes | Where-Object { $_ -is [System.Management.Automation.ValidateSetAttribute] } | Select-Object -First 1
+        if     ($vset)                                    { $allowed = [string[]]$vset.ValidValues }
+        elseif ($elem.IsEnum)                             { $allowed = [string[]][enum]::GetNames($elem) }
+        elseif ($Hints -and $Hints.ContainsKey($p.Name))  { $allowed = [string[]]$Hints[$p.Name] }
+        elseif ($ParamHints.ContainsKey($p.Name))         { $allowed = [string[]]$ParamHints[$p.Name] }
+        if ($allowed) { Write-Host ('     allowed values: ' + ($allowed -join ', ')) -ForegroundColor White }
         while ($true) {
             $ans = Read-Host ("Map -{0} (column / =fixed / Enter){1}" -f $p.Name, $(if ($required) { ' [required]' } else { '' }))
             if ([string]::IsNullOrWhiteSpace($ans)) {
                 if ($required) { Write-Host '  Required - give a column name or =value.' -ForegroundColor Yellow; continue }
                 return
             }
-            if ($ans.StartsWith('=')) { $map[$p.Name] = @{ Kind='fixed'; Value=$ans.Substring(1) }; return }
+            if ($ans.StartsWith('=')) {
+                $fv = $ans.Substring(1)
+                # Validate a fixed value against the allowed set (column values are
+                # per-row and can't be checked here). -contains is case-insensitive.
+                if ($allowed -and ($allowed -notcontains $fv)) {
+                    Write-Host ("  '{0}' is not allowed. Choose from: {1}" -f $fv, ($allowed -join ', ')) -ForegroundColor Yellow; continue
+                }
+                $map[$p.Name] = @{ Kind='fixed'; Value=$fv }; return
+            }
             if ($columns -contains $ans) { $map[$p.Name] = @{ Kind='column'; Value=$ans }; return }
             Write-Host ("  '{0}' is not a column. Available: {1}" -f $ans, ($columns -join ', ')) -ForegroundColor Yellow
         }
@@ -1001,7 +1091,7 @@ function Invoke-BulkCmdlet {
             switch ($m.Kind) {
                 'column' { $b[$k] = $row.$($m.Value) }
                 'fixed'  { $b[$k] = $m.Value }
-                'switch' { $b[$k] = $true }
+                'switch' { $b[$k] = [switch]$true }   # [switch] so preview shows -Force, not -Force $true
             }
         }
         if ($Transform) {
@@ -1208,6 +1298,7 @@ function Read-ParameterValue {
             return $sel.Value
         }
         if ([string]::IsNullOrWhiteSpace($val) -and $Required) {
+            if (Test-InputEnded) { throw [System.IO.EndOfStreamException]::new('No more input (stdin closed).') }
             Write-Host '  This one is required.' -ForegroundColor Yellow
             continue
         }
@@ -1219,6 +1310,18 @@ function Read-ParameterValue {
             try { $match = & $lookup.Resolve $val } catch { }
             if (-not $match) {
                 Write-Host ("  No mailbox/user found matching '{0}'. Check the spelling, or type 'find' to search." -f $val) -ForegroundColor Yellow
+                continue
+            }
+        }
+        # Boolean fields: the parameter binder rejects a String bound to a [bool]
+        # (e.g. -AutoMapping), so convert the typed answer into a real boolean here
+        # and re-prompt on anything that isn't a yes/no answer. Note 'false' as a
+        # string is truthy in PowerShell, so we must map it explicitly - never cast.
+        if ($elem -eq [bool]) {
+            if     ($key -in @('true','yes','y','1'))  { return $true }
+            elseif ($key -in @('false','no','n','0')) { return $false }
+            else {
+                Write-Host '  Please answer true or false.' -ForegroundColor Yellow
                 continue
             }
         }
@@ -1377,7 +1480,7 @@ function Invoke-Action {
                 -Options @('Run once (type the values now)','Bulk - run for every row in a CSV file') -AllowBack
     if (-not $mode) { return 'again' }
     if ($mode -like 'Bulk*') {
-        Invoke-BulkCmdlet  -Cmdlet $Action.Cmdlet -Prompt $Action.Prompt -ParamHelp $Action.ParamHelp -Preset $Action.Preset -Transform $Action.Transform
+        Invoke-BulkCmdlet  -Cmdlet $Action.Cmdlet -Prompt $Action.Prompt -ParamHelp $Action.ParamHelp -Preset $Action.Preset -Hints $Action.Hints -Transform $Action.Transform
     } else {
         Invoke-GuidedCmdlet -Cmdlet $Action.Cmdlet -Prompt $Action.Prompt -Help $Action.Help -ParamHelp $Action.ParamHelp -Preset $Action.Preset -Hints $Action.Hints -Transform $Action.Transform -Project $Action.Project
     }
@@ -1404,9 +1507,31 @@ function Start-M365Toolkit {
 
     $logDir = Join-Path $script:ToolkitHome 'logs'
     if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out-Null }
+    # Logs can contain PII (names/emails) and connection detail, so restrict the
+    # folder to the current user and purge anything older than 30 days. Best-effort:
+    # never let a permissions/purge hiccup stop the tool from starting.
+    $onWindows = $IsWindows -or ($env:OS -eq 'Windows_NT')   # $IsWindows is $null on Windows PowerShell 5.1
+    try {
+        if ($onWindows) {
+            $acl = Get-Acl $logDir
+            $acl.SetAccessRuleProtection($true, $false)   # stop inheriting; drop inherited entries
+            $me  = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                        $me, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+            $acl.SetAccessRule($rule)
+            Set-Acl -Path $logDir -AclObject $acl
+        } else {
+            & chmod 700 $logDir 2>$null
+        }
+    } catch { }
+    try {
+        Get-ChildItem -Path $logDir -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-30) } |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+    } catch { }
     $stamp  = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $logFile = Join-Path $logDir "session-$stamp.log"
-    Start-Transcript -Path $logFile -Append | Out-Null
+    $script:LogFile = Join-Path $logDir "session-$stamp.log"   # script-scoped so the connect step can pause/resume it
+    Start-Transcript -Path $script:LogFile -Append | Out-Null
     try {
         Write-Host '=====================================================' -ForegroundColor White
         Write-Host '  Microsoft 365 Guided Command Builder  (v0.18)'       -ForegroundColor White
@@ -1430,9 +1555,19 @@ function Start-M365Toolkit {
 
             $service = $Services | Where-Object { $_.Name -eq $svcName }
             if (-not $connected[$svcName]) {
-                Connect-M365Service -Service $service -Upn $upn
-                $connected[$svcName] = $true
-                Show-WhoAmI -Service $service -Upn $upn
+                # A failed sign-in (bad creds, cancelled login, no network) throws
+                # under $ErrorActionPreference='Stop'. Without this catch it unwinds
+                # past the whole main loop and kills the tool. Instead, report it and
+                # drop back to the service menu so the user can retry or pick another.
+                try {
+                    Connect-M365Service -Service $service -Upn $upn
+                    $connected[$svcName] = $true
+                    Show-WhoAmI -Service $service -Upn $upn
+                } catch {
+                    Write-Host ("Could not connect to {0}: {1}" -f $svcName, $_.Exception.Message) -ForegroundColor Red
+                    Write-Host 'Back to the service menu - try again, or pick another service / Quit.' -ForegroundColor White
+                    continue
+                }
             }
             Save-ToolkitConfig -Upn $upn -LastService $svcName
 
@@ -1543,6 +1678,11 @@ function Start-M365Toolkit {
             if ($quit) { break }
         }
         Write-Host 'Goodbye.' -ForegroundColor White
+    }
+    catch [System.IO.EndOfStreamException] {
+        # Non-interactive run with no more piped input - exit cleanly instead of
+        # spinning forever on an unanswerable prompt.
+        Write-Host 'Input ended - exiting.' -ForegroundColor White
     }
     finally {
         Stop-Transcript | Out-Null
