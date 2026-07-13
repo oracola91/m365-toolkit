@@ -16,7 +16,7 @@
       3. $Actions   - plain-language catalogue: friendly label -> cmdlet.
 
 .NOTES
-    v0.18 - 2026-07-10. Runs on Windows PowerShell 5.1 or PowerShell 7+.
+    v0.19 - 2026-07-13. Runs on Windows PowerShell 5.1 or PowerShell 7+.
     Requires the relevant module installed for whichever service you connect to.
 #>
 
@@ -125,6 +125,49 @@ function Get-UserSharedMailboxAccess {
             @(Get-MailboxPermission -Identity $_.Identity -User $User -ErrorAction SilentlyContinue |
                 Where-Object { $_.AccessRights -contains 'FullAccess' -and -not $_.IsInherited }).Count -gt 0
         }
+}
+
+# Turn a Get-MailboxFolderPermission entry's .User object back into a value that
+# Set/Remove-MailboxFolderPermission -User will actually bind to. That object is
+# a MailboxFolderUserId whose usable address hides in different places depending
+# on whether the grantee is an internal user, a mail-enabled recipient, or an
+# unresolved name - so try the reliable SMTP paths first and fall back to the
+# display name. Best-effort; returns $null only if nothing at all is present.
+function Get-FolderPermissionUserAddress {
+    param([Parameter(Mandatory)] $User)
+    foreach ($sb in @(
+        { $User.ADRecipient.PrimarySmtpAddress },
+        { $User.RecipientPrincipal.PrimarySmtpAddress },
+        { $User.ADRecipient.WindowsLiveID },
+        { $User.DisplayName }
+    )) {
+        $candidate = $null
+        try { $candidate = & $sb } catch { }
+        if ($candidate) { return [string]$candidate }
+    }
+    return $null
+}
+
+# A dependent candidate source (see the 'Candidates' action hook): given the
+# values collected so far, returns the people who ALREADY have a permission entry
+# on the chosen mailbox's calendar - i.e. the only valid targets for CHANGING or
+# REMOVING calendar access (Set/Remove-MailboxFolderPermission fail with "no
+# existing permission entry" for anyone else). Reads $bound['Identity'] as the
+# raw mailbox (the ':\Calendar' Transform hasn't run yet), filters out the
+# built-in Default/Anonymous rows, and drops anyone we can't turn into a bindable
+# address. Returns objects shaped like the $ParamLookup hits: .Display / .Value.
+$calendarUserCandidates = { param($bound)
+    $mbx = "$($bound['Identity'])".Trim()
+    if ([string]::IsNullOrWhiteSpace($mbx)) { return @() }
+    Get-MailboxFolderPermission -Identity ('{0}:\Calendar' -f $mbx) -ErrorAction Stop |
+        Where-Object { $_.User.DisplayName -notin @('Default','Anonymous') } |
+        ForEach-Object {
+            $addr = Get-FolderPermissionUserAddress -User $_.User
+            [pscustomobject]@{
+                Display = ('{0}  <{1}>  [{2}]' -f $_.User.DisplayName, $(if ($addr) { $addr } else { '?' }), (@($_.AccessRights) -join ', '))
+                Value   = $addr
+            }
+        } | Where-Object { $_.Value }
 }
 
 # ---------------------------------------------------------------------------
@@ -276,8 +319,9 @@ $Actions = @(
         Label='Change a user''s calendar access'
         Cmdlet='Set-MailboxFolderPermission'; Prompt=@('Identity','User','AccessRights')
         Transform=@{ Identity = { param($v) '{0}:\Calendar' -f $v } }
+        Candidates=@{ User = $calendarUserCandidates }
         Hints=@{ AccessRights=@('Owner','PublishingEditor','Editor','PublishingAuthor','Author','NonEditingAuthor','Reviewer','Contributor','AvailabilityOnly','LimitedDetails','None') }
-        Help='Change the role of someone who ALREADY has access to a calendar (fails if they have no existing entry - use "Give a user access" first).'
+        Help='Change the role of someone who ALREADY has access to a calendar (fails if they have no existing entry - use "Give a user access" first). After you pick the calendar, the tool lists only the people who already have an entry, so you can''t hit the "no existing entry" error.'
         ParamHelp=@{
             Identity     = 'The mailbox whose calendar is shared (its \Calendar folder is targeted automatically)'
             User         = 'The person whose access you are changing'
@@ -289,7 +333,8 @@ $Actions = @(
         Label='Remove a user''s calendar access'
         Cmdlet='Remove-MailboxFolderPermission'; Prompt=@('Identity','User')
         Transform=@{ Identity = { param($v) '{0}:\Calendar' -f $v } }
-        Help='Take away a person''s access to a mailbox''s calendar.'
+        Candidates=@{ User = $calendarUserCandidates }
+        Help='Take away a person''s access to a mailbox''s calendar. After you pick the calendar, the tool lists only the people who currently have an entry, so you pick from real grants instead of guessing.'
         ParamHelp=@{
             Identity = 'The mailbox whose calendar was shared (its \Calendar folder is targeted automatically)'
             User     = 'The person who will LOSE calendar access'
@@ -759,7 +804,8 @@ function Invoke-GuidedCmdlet {
         [hashtable] $Preset,     # optional param values fixed by the action (never prompted)
         [hashtable] $Hints,      # optional per-action allowed-value overrides (name -> values)
         [hashtable] $Transform,  # optional post-processing of collected values (name -> scriptblock)
-        [scriptblock] $Project   # optional reshaping of the RESULT before display (raw result -> clean objects)
+        [scriptblock] $Project,  # optional reshaping of the RESULT before display (raw result -> clean objects)
+        [hashtable] $Candidates  # optional dependent pick-lists (name -> { param($bound) ... }): valid values derived from fields already chosen
     )
 
     $cmd      = Get-Command $Cmdlet -ErrorAction Stop
@@ -807,7 +853,7 @@ function Invoke-GuidedCmdlet {
     while ($ri -lt $reqList.Count) {
         $p = $reqList[$ri]
         $desc = Get-ParamDescription -Name $p.Name -ParamHelp $ParamHelp -Cmdlet $Cmdlet
-        $val = Read-ParameterValue -Param $p -Required -Description $desc -Hints $Hints
+        $val = Read-ParameterValue -Param $p -Required -Description $desc -Hints $Hints -Candidates $Candidates -Bound $bound
         if ($script:ParamCancel) { Write-Host 'Cancelled - back to the menu (nothing was run).' -ForegroundColor White; return }
         if ($script:ParamBack) {
             if ($ri -eq 0) { Write-Host "  Already at the first field - type 'cancel' to return to the menu." -ForegroundColor White; continue }
@@ -823,7 +869,7 @@ function Invoke-GuidedCmdlet {
     # ---- Optional params named in the curated list: ask them outright.
     foreach ($p in ($optional | Where-Object { $promptList -contains $_.Name -and -not $bound.Contains($_.Name) })) {
         $desc = Get-ParamDescription -Name $p.Name -ParamHelp $ParamHelp -Cmdlet $Cmdlet
-        $v = Read-ParameterValue -Param $p -Description $desc -Hints $Hints
+        $v = Read-ParameterValue -Param $p -Description $desc -Hints $Hints -Candidates $Candidates -Bound $bound
         # 'cancel' aborts the whole action; 'back' on an OPTIONAL field just skips it.
         if ($script:ParamCancel) { Write-Host 'Cancelled - back to the menu (nothing was run).' -ForegroundColor White; return }
         if (-not $script:ParamBack -and $null -ne $v) { $bound[$p.Name] = $v }
@@ -838,7 +884,7 @@ function Invoke-GuidedCmdlet {
         Write-Host ''
         Write-Host ("Optional: {0} - enter it now, or press Enter to skip." -f $p.Name) -ForegroundColor White
         $desc = Get-ParamDescription -Name $p.Name -ParamHelp $ParamHelp -Cmdlet $Cmdlet
-        $v = Read-ParameterValue -Param $p -Description $desc -Hints $Hints
+        $v = Read-ParameterValue -Param $p -Description $desc -Hints $Hints -Candidates $Candidates -Bound $bound
         # 'cancel' aborts the whole action; 'back' on an OPTIONAL field just skips it.
         if ($script:ParamCancel) { Write-Host 'Cancelled - back to the menu (nothing was run).' -ForegroundColor White; return }
         if (-not $script:ParamBack -and $null -ne $v) { $bound[$p.Name] = $v }
@@ -865,7 +911,7 @@ function Invoke-GuidedCmdlet {
             if ($idx -ge 0 -and $idx -lt $optRest.Count) {
                 $p = $optRest[$idx]
                 $desc = Get-ParamDescription -Name $p.Name -ParamHelp $ParamHelp -Cmdlet $Cmdlet
-                $v = Read-ParameterValue -Param $p -Description $desc -Hints $Hints
+                $v = Read-ParameterValue -Param $p -Description $desc -Hints $Hints -Candidates $Candidates -Bound $bound
                 # 'cancel' aborts the whole action; 'back' just skips this optional pick.
                 if ($script:ParamCancel) { Write-Host 'Cancelled - back to the menu (nothing was run).' -ForegroundColor White; return }
                 if (-not $script:ParamBack -and $null -ne $v) { $bound[$p.Name] = $v }
@@ -1185,7 +1231,9 @@ function Read-ParameterValue {
         [Parameter(Mandatory)] $Param,
         [switch] $Required,
         [string] $Description,  # plain-language "what is this field?" shown above the prompt
-        [hashtable] $Hints      # per-action allowed-value override (name -> values); beats global $ParamHints
+        [hashtable] $Hints,     # per-action allowed-value override (name -> values); beats global $ParamHints
+        [hashtable] $Candidates, # per-action dependent pick-lists (name -> { param($bound) ... }) derived from fields already chosen
+        $Bound                  # values collected so far (an [ordered] dict), passed to a Candidates scriptblock
     )
     $script:ParamBack   = $false  # cleared each prompt; set if the user types 'back'   (go to previous field)
     $script:ParamCancel = $false  # cleared each prompt; set if the user types 'cancel' (abort action to menu)
@@ -1211,6 +1259,48 @@ function Read-ParameterValue {
     # Both support 'back'/'cancel' via the shared helper.
     if ($allowed) {
         return Read-OptionMenu -Name $name -Options $allowed -Multi:$isArray -Description $Description
+    }
+
+    # Dependent pick-list: some fields are constrained by a field already chosen
+    # (e.g. calendar -User must be someone who ALREADY has a permission entry on
+    # the chosen calendar). The action supplies a scriptblock that, given the
+    # values collected so far, returns the valid candidates (.Display / .Value).
+    # We present them as a numbered list so the user can't fill in someone with no
+    # entry and then hit the cmdlet's "no existing permission entry" error. An
+    # 'enter a different value' escape falls through to the normal free-text prompt
+    # (in case the live list missed a valid target). If the source errors, we warn
+    # and fall through rather than block. Single-value fields only.
+    if ($Candidates -and $Candidates.ContainsKey($name) -and -not $isArray) {
+        $cands = $null
+        try { $cands = @(& $Candidates[$name] $Bound) }
+        catch {
+            Write-Host ('  Could not build the list of eligible values ({0}).' -f $_.Exception.Message) -ForegroundColor Yellow
+            Write-Host '  Falling back to typing the value.' -ForegroundColor Yellow
+        }
+        if ($null -ne $cands) {
+            if ($cands.Count -eq 0) {
+                Write-Host ''
+                Write-Host '  Nobody (other than the built-in Default/Anonymous entries) currently has a' -ForegroundColor Yellow
+                Write-Host '  permission entry on this calendar - so there is nothing to change or remove here.' -ForegroundColor Yellow
+                $alt = Get-MenuChoice -Title '  What do you want to do?' `
+                            -Options @('Cancel this action','Type an address manually anyway') -AllowBack
+                if (-not $alt -or $alt -eq 'Cancel this action') { $script:ParamCancel = $true; return $null }
+                # 'Type an address manually anyway' -> fall through to the normal prompt below.
+            }
+            else {
+                $pick = Get-MenuChoice -Title ("  Who already has access? Pick the person for -{0}:" -f $name) `
+                            -Options @($cands.Display) `
+                            -ExtraOptions @('Type a different address','Cancel this action') -AllowBack
+                if (-not $pick)                        { $script:ParamBack   = $true; return $null }  # 0/Back = previous field
+                if ($pick -eq 'Cancel this action')    { $script:ParamCancel = $true; return $null }
+                if ($pick -ne 'Type a different address') {
+                    $sel = $cands | Where-Object { $_.Display -eq $pick } | Select-Object -First 1
+                    Write-Host ('  -> using {0}' -f $sel.Value) -ForegroundColor White
+                    return $sel.Value
+                }
+                # 'Type a different address' -> fall through to the normal prompt below.
+            }
+        }
     }
 
     # Otherwise a prompt line with a human-friendly hint.
@@ -1482,7 +1572,7 @@ function Invoke-Action {
     if ($mode -like 'Bulk*') {
         Invoke-BulkCmdlet  -Cmdlet $Action.Cmdlet -Prompt $Action.Prompt -ParamHelp $Action.ParamHelp -Preset $Action.Preset -Hints $Action.Hints -Transform $Action.Transform
     } else {
-        Invoke-GuidedCmdlet -Cmdlet $Action.Cmdlet -Prompt $Action.Prompt -Help $Action.Help -ParamHelp $Action.ParamHelp -Preset $Action.Preset -Hints $Action.Hints -Transform $Action.Transform -Project $Action.Project
+        Invoke-GuidedCmdlet -Cmdlet $Action.Cmdlet -Prompt $Action.Prompt -Help $Action.Help -ParamHelp $Action.ParamHelp -Preset $Action.Preset -Hints $Action.Hints -Transform $Action.Transform -Project $Action.Project -Candidates $Action.Candidates
     }
     Get-NextStep
 }
@@ -1534,7 +1624,7 @@ function Start-M365Toolkit {
     Start-Transcript -Path $script:LogFile -Append | Out-Null
     try {
         Write-Host '=====================================================' -ForegroundColor White
-        Write-Host '  Microsoft 365 Guided Command Builder  (v0.18)'       -ForegroundColor White
+        Write-Host '  Microsoft 365 Guided Command Builder  (v0.19)'       -ForegroundColor White
         Write-Host '=====================================================' -ForegroundColor White
 
         $cfg = Get-ToolkitConfig
