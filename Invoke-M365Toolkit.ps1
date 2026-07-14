@@ -16,7 +16,7 @@
       3. $Actions   - plain-language catalogue: friendly label -> cmdlet.
 
 .NOTES
-    v0.19 - 2026-07-13. Runs on Windows PowerShell 5.1 or PowerShell 7+.
+    v0.20 - 2026-07-13. Runs on Windows PowerShell 5.1 or PowerShell 7+.
     Requires the relevant module installed for whichever service you connect to.
 #>
 
@@ -96,7 +96,10 @@ $Services = @(
         Module      = 'Microsoft.Graph'
         ConnectCmd  = 'Connect-MgGraph'
         # Same Graph SDK as Entra, but consented for device-management scopes.
-        ConnectArgs = { param($Upn) @{ Scopes = 'DeviceManagementManagedDevices.ReadWrite.All','DeviceManagementConfiguration.ReadWrite.All'; UseDeviceCode = $true } }
+        # Read-only (least privilege): the only catalogued Intune action lists
+        # enrolled devices (Get-MgDeviceManagementManagedDevice). If a write
+        # action is ever added, widen the matching scope to .ReadWrite.All then.
+        ConnectArgs = { param($Upn) @{ Scopes = 'DeviceManagementManagedDevices.Read.All','DeviceManagementConfiguration.Read.All'; UseDeviceCode = $true } }
         Disconnect  = 'Disconnect-MgGraph'
     }
     [pscustomobject]@{
@@ -629,12 +632,15 @@ function Connect-M365Service {
 function Format-CommandPreview {
     param(
         [Parameter(Mandatory)] [string]                       $Cmdlet,
-        [Parameter(Mandatory)] [System.Collections.IDictionary] $BoundParams   # IDictionary (not [hashtable]) so an [ordered] dict keeps its insertion order
+        [Parameter(Mandatory)] [System.Collections.IDictionary] $BoundParams,   # IDictionary (not [hashtable]) so an [ordered] dict keeps its insertion order
+        [string[]] $Secret = @()   # param names whose values are secrets - render masked, never in plaintext
     )
     $sb = [System.Text.StringBuilder]::new($Cmdlet)
     foreach ($key in $BoundParams.Keys) {
         $val = $BoundParams[$key]
-        if ($val -is [switch]) {
+        if ($Secret -contains $key) {
+            [void]$sb.Append(" -$key '********'")   # secret: masked so it never reaches the screen/transcript
+        } elseif ($val -is [switch]) {
             if ($val.IsPresent) { [void]$sb.Append(" -$key") }
         } elseif ($val -is [bool]) {
             [void]$sb.Append(" -$key `$$($val.ToString().ToLower())")
@@ -823,6 +829,7 @@ function Invoke-GuidedCmdlet {
     }
 
     $bound = [ordered]@{}
+    $secretKeys = [System.Collections.Generic.List[string]]::new()   # params read as masked secrets; masked in preview + undo log
 
     # ---- Presets: values fixed by the action itself (e.g. -Shared for a shared
     #      mailbox, -Type Shared to convert). Bound automatically, shown in the
@@ -863,6 +870,7 @@ function Invoke-GuidedCmdlet {
             continue
         }
         $bound[$p.Name] = $val
+        if ($script:ParamSecret) { $secretKeys.Add($p.Name) }
         $ri++
     }
 
@@ -872,7 +880,7 @@ function Invoke-GuidedCmdlet {
         $v = Read-ParameterValue -Param $p -Description $desc -Hints $Hints -Candidates $Candidates -Bound $bound
         # 'cancel' aborts the whole action; 'back' on an OPTIONAL field just skips it.
         if ($script:ParamCancel) { Write-Host 'Cancelled - back to the menu (nothing was run).' -ForegroundColor White; return }
-        if (-not $script:ParamBack -and $null -ne $v) { $bound[$p.Name] = $v }
+        if (-not $script:ParamBack -and $null -ne $v) { $bound[$p.Name] = $v; if ($script:ParamSecret) { $secretKeys.Add($p.Name) } }
     }
 
     # ---- Remaining optional params: offer the list, let the user pick which to set.
@@ -887,7 +895,7 @@ function Invoke-GuidedCmdlet {
         $v = Read-ParameterValue -Param $p -Description $desc -Hints $Hints -Candidates $Candidates -Bound $bound
         # 'cancel' aborts the whole action; 'back' on an OPTIONAL field just skips it.
         if ($script:ParamCancel) { Write-Host 'Cancelled - back to the menu (nothing was run).' -ForegroundColor White; return }
-        if (-not $script:ParamBack -and $null -ne $v) { $bound[$p.Name] = $v }
+        if (-not $script:ParamBack -and $null -ne $v) { $bound[$p.Name] = $v; if ($script:ParamSecret) { $secretKeys.Add($p.Name) } }
     }
     elseif ($optRest.Count -gt 0) {
         Write-Host ''
@@ -914,7 +922,7 @@ function Invoke-GuidedCmdlet {
                 $v = Read-ParameterValue -Param $p -Description $desc -Hints $Hints -Candidates $Candidates -Bound $bound
                 # 'cancel' aborts the whole action; 'back' just skips this optional pick.
                 if ($script:ParamCancel) { Write-Host 'Cancelled - back to the menu (nothing was run).' -ForegroundColor White; return }
-                if (-not $script:ParamBack -and $null -ne $v) { $bound[$p.Name] = $v }
+                if (-not $script:ParamBack -and $null -ne $v) { $bound[$p.Name] = $v; if ($script:ParamSecret) { $secretKeys.Add($p.Name) } }
             }
         }
     }
@@ -966,7 +974,7 @@ function Invoke-GuidedCmdlet {
     }
 
     # ---- Dry-run preview + final confirm. -----------------------------------
-    $preview = Format-CommandPreview -Cmdlet $Cmdlet -BoundParams $bound
+    $preview = Format-CommandPreview -Cmdlet $Cmdlet -BoundParams $bound -Secret @($secretKeys)
     Write-Host ''
     Write-Host 'Preview (dry-run):' -ForegroundColor Yellow
     Write-Host ('  ' + $preview) -ForegroundColor White
@@ -1007,7 +1015,7 @@ function Invoke-GuidedCmdlet {
             $rb = [ordered]@{}
             foreach ($k in $revertPlan.Keys.Keys)   { $rb[$k] = $revertPlan.Keys[$k] }
             foreach ($k in $revertPlan.Before.Keys) { $rb[$k] = $revertPlan.Before[$k] }
-            $revCmd = Format-CommandPreview -Cmdlet $Cmdlet -BoundParams $rb
+            $revCmd = Format-CommandPreview -Cmdlet $Cmdlet -BoundParams $rb -Secret @($secretKeys)
             Write-Host ''
             Write-Host 'To undo this change, run:' -ForegroundColor Yellow
             Write-Host ('  ' + $revCmd) -ForegroundColor White
@@ -1016,6 +1024,15 @@ function Invoke-GuidedCmdlet {
                 if (-not (Test-Path $undoDir)) { New-Item -ItemType Directory -Path $undoDir | Out-Null }
                 $undoFile = Join-Path $undoDir 'undo-hints.log'
                 Add-Content -Path $undoFile -Value ('{0}  {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $revCmd)
+                # This single file is appended to on every reverted change, so the
+                # 30-day LastWriteTime purge never ages it out. Cap it to the most
+                # recent entries and lock it to the current user (it holds plaintext
+                # identities + before/after values).
+                try {
+                    $lines = @(Get-Content -Path $undoFile -ErrorAction SilentlyContinue)
+                    if ($lines.Count -gt 500) { Set-Content -Path $undoFile -Value ($lines[-500..-1]) -Encoding UTF8 }
+                } catch { }
+                Protect-LocalPath -Path $undoFile
                 Write-Host ('  (also saved to {0})' -f $undoFile) -ForegroundColor White
             } catch {}
         }
@@ -1237,6 +1254,7 @@ function Read-ParameterValue {
     )
     $script:ParamBack   = $false  # cleared each prompt; set if the user types 'back'   (go to previous field)
     $script:ParamCancel = $false  # cleared each prompt; set if the user types 'cancel' (abort action to menu)
+    $script:ParamSecret = $false  # cleared each prompt; set true when the value read was a masked secret (mask it in preview/logs)
     $name    = $Param.Name
     $type    = $Param.ParameterType
     $isArray = $type.IsArray
@@ -1254,6 +1272,33 @@ function Read-ParameterValue {
 
     # Say what the field means before asking for it.
     if ($Description) { Write-Host ("  -> {0}" -f $Description) -ForegroundColor White }
+
+    # Secret fields: never echo to screen or transcript. Triggered by a
+    # [SecureString] param, or a plain param whose name looks like a credential
+    # (Password/Secret/Token/Key/...). Read masked via Read-Host -AsSecureString
+    # (its input is NOT captured by Start-Transcript). Bind a SecureString param
+    # as-is; a string-typed secret is converted to plaintext only at return, and
+    # $script:ParamSecret tells the caller to mask it in the preview and logs.
+    # Mainly a guard for the "Run any command" hatch (the curated catalogue has
+    # no secret params). No back/cancel here - you can't type a keyword blind.
+    $isSecret = (-not $isArray) -and ( ($elem -eq [securestring]) -or
+        ($name -match '(?i)(password|passwd|pwd|secret|credential|token|apikey|api[_-]?key|clientsecret|access[_-]?key)') )
+    if ($isSecret) {
+        while ($true) {
+            $sec = Read-Host ("Enter -{0} (hidden){1}" -f $name, $(if ($Required) { ' (required)' } else { ' - or press Enter to skip' })) -AsSecureString
+            $len = 0; try { $len = $sec.Length } catch { }
+            if ($len -eq 0) {
+                if ($Required) {
+                    if (Test-InputEnded) { throw [System.IO.EndOfStreamException]::new('No more input (stdin closed).') }
+                    Write-Host '  This one is required.' -ForegroundColor Yellow; continue
+                }
+                return $null
+            }
+            $script:ParamSecret = $true
+            if ($elem -eq [securestring]) { return $sec }
+            return [System.Net.NetworkCredential]::new('', $sec).Password   # string-typed secret: bind plaintext, masked in preview/logs
+        }
+    }
 
     # Fixed set of allowed values -> numbered picker (multi-select for arrays).
     # Both support 'back'/'cancel' via the shared helper.
@@ -1513,6 +1558,27 @@ function Show-Result {
 # Tiny persisted config (UPN + last service) at <ToolkitHome>\config.json so
 # you don't retype your email every launch.
 # ---------------------------------------------------------------------------
+# Restrict a file or directory to the current user only. Best-effort and
+# cross-platform: an NTFS ACL (no inheritance, owner FullControl) on Windows,
+# chmod 600 (file) / 700 (dir) elsewhere. Never throws - a perms hiccup must not
+# stop the tool. Used for logs/, config.json, and undo-hints.log.
+function Protect-LocalPath {
+    param([Parameter(Mandatory)] [string] $Path, [switch] $Directory)
+    $onWindows = $IsWindows -or ($env:OS -eq 'Windows_NT')   # $IsWindows is $null on Windows PowerShell 5.1
+    try {
+        if ($onWindows) {
+            $acl = Get-Acl $Path
+            $acl.SetAccessRuleProtection($true, $false)   # stop inheriting; drop inherited entries
+            $me  = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+            $inherit = if ($Directory) { 'ContainerInherit,ObjectInherit' } else { 'None' }
+            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($me, 'FullControl', $inherit, 'None', 'Allow')
+            $acl.SetAccessRule($rule)
+            Set-Acl -Path $Path -AclObject $acl
+        } else {
+            & chmod ($(if ($Directory) { '700' } else { '600' })) $Path 2>$null
+        }
+    } catch { }
+}
 function Get-ToolkitConfig {
     $path = Join-Path $script:ToolkitHome 'config.json'
     if (Test-Path $path) { try { return (Get-Content $path -Raw | ConvertFrom-Json) } catch { } }
@@ -1521,8 +1587,10 @@ function Get-ToolkitConfig {
 function Save-ToolkitConfig {
     param([string] $Upn, [string] $LastService)
     if (-not (Test-Path $script:ToolkitHome)) { New-Item -ItemType Directory -Path $script:ToolkitHome -Force | Out-Null }
+    $cfgPath = Join-Path $script:ToolkitHome 'config.json'
     [pscustomobject]@{ Upn = $Upn; LastService = $LastService } |
-        ConvertTo-Json | Set-Content -Path (Join-Path $script:ToolkitHome 'config.json') -Encoding UTF8
+        ConvertTo-Json | Set-Content -Path $cfgPath -Encoding UTF8
+    Protect-LocalPath -Path $cfgPath   # holds UPN + last service (no secrets), but keep it owner-only anyway
 }
 
 # ---------------------------------------------------------------------------
@@ -1600,20 +1668,7 @@ function Start-M365Toolkit {
     # Logs can contain PII (names/emails) and connection detail, so restrict the
     # folder to the current user and purge anything older than 30 days. Best-effort:
     # never let a permissions/purge hiccup stop the tool from starting.
-    $onWindows = $IsWindows -or ($env:OS -eq 'Windows_NT')   # $IsWindows is $null on Windows PowerShell 5.1
-    try {
-        if ($onWindows) {
-            $acl = Get-Acl $logDir
-            $acl.SetAccessRuleProtection($true, $false)   # stop inheriting; drop inherited entries
-            $me  = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-                        $me, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
-            $acl.SetAccessRule($rule)
-            Set-Acl -Path $logDir -AclObject $acl
-        } else {
-            & chmod 700 $logDir 2>$null
-        }
-    } catch { }
+    Protect-LocalPath -Path $logDir -Directory
     try {
         Get-ChildItem -Path $logDir -File -ErrorAction SilentlyContinue |
             Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-30) } |
@@ -1624,7 +1679,7 @@ function Start-M365Toolkit {
     Start-Transcript -Path $script:LogFile -Append | Out-Null
     try {
         Write-Host '=====================================================' -ForegroundColor White
-        Write-Host '  Microsoft 365 Guided Command Builder  (v0.19)'       -ForegroundColor White
+        Write-Host '  Microsoft 365 Guided Command Builder  (v0.20)'       -ForegroundColor White
         Write-Host '=====================================================' -ForegroundColor White
 
         $cfg = Get-ToolkitConfig
