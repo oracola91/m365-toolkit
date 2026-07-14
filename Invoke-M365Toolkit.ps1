@@ -16,7 +16,10 @@
       3. $Actions   - plain-language catalogue: friendly label -> cmdlet.
 
 .NOTES
-    v0.22 - 2026-07-14. Runs on Windows PowerShell 5.1 or PowerShell 7+.
+    v0.23 - 2026-07-14. Engine runs on PowerShell 7+ (Windows/macOS/Linux) and
+    Windows PowerShell 5.1. Per service: Exchange, Purview, Entra, Intune and Teams
+    work everywhere; SharePoint (PnP) needs pwsh 7.2+; SharePoint Admin (SPO) and
+    Power Platform use Windows-only modules and run on Windows only.
     Requires the relevant module installed for whichever service you connect to.
 #>
 
@@ -90,6 +93,7 @@ $Services = @(
         # Tenant admin cmdlets (Get-SPOSite, Set-SPOTenant...). Needs the -admin URL.
         ConnectArgs = { param($Upn) @{ Url = (Read-Host 'SharePoint ADMIN URL (e.g. https://shelly-admin.sharepoint.com)') } }
         Disconnect  = 'Disconnect-SPOService'
+        WinOnly     = $true   # Microsoft.Online.SharePoint.PowerShell is a .NET Framework (Windows-only) module
     }
     [pscustomobject]@{
         Name        = 'Intune / Devices (Graph)'
@@ -108,6 +112,7 @@ $Services = @(
         ConnectCmd  = 'Add-PowerAppsAccount'   # opens an interactive sign-in
         ConnectArgs = { param($Upn) @{ } }
         Disconnect  = 'Remove-PowerAppsAccount'
+        WinOnly     = $true   # Microsoft.PowerApps.Administration.PowerShell is a .NET Framework (Windows-only) module
     }
 )
 
@@ -626,6 +631,14 @@ function Connect-M365Service {
         [Parameter(Mandatory)] [pscustomobject] $Service,
         [Parameter(Mandatory)] [string]         $Upn
     )
+    # Two vendor modules (SharePoint Admin, Power Platform) are built on .NET
+    # Framework and only exist on Windows - they cannot load on macOS/Linux no
+    # matter what we do. Fail with a clear message instead of a confusing install
+    # or import error. ($IsWindows is undefined on Windows PowerShell 5.1, so test
+    # for an explicit $false - that only matches pwsh 6+ on macOS/Linux.)
+    if ($Service.WinOnly -and ($IsWindows -eq $false)) {
+        throw "'$($Service.Name)' uses a Windows-only module ($($Service.Module)) that Microsoft does not provide for macOS/Linux. Run this service from Windows (PowerShell 5.1 or 7)."
+    }
     if (-not (Get-Module -ListAvailable -Name $Service.Module)) {
         Write-Host ("Module '{0}' is not installed." -f $Service.Module) -ForegroundColor Yellow
         if ((Read-Host 'Install it now for the current user? (y/n)') -match '^(y|yes)$') {
@@ -1761,7 +1774,7 @@ function Start-M365Toolkit {
     Start-Transcript -Path $script:LogFile -Append | Out-Null
     try {
         Write-Host '=====================================================' -ForegroundColor White
-        Write-Host '  Microsoft 365 Guided Command Builder  (v0.22)'       -ForegroundColor White
+        Write-Host '  Microsoft 365 Guided Command Builder  (v0.23)'       -ForegroundColor White
         Write-Host '=====================================================' -ForegroundColor White
 
         $cfg = Get-ToolkitConfig
