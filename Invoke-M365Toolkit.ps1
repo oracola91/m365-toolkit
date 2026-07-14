@@ -16,7 +16,7 @@
       3. $Actions   - plain-language catalogue: friendly label -> cmdlet.
 
 .NOTES
-    v0.21 - 2026-07-14. Runs on Windows PowerShell 5.1 or PowerShell 7+.
+    v0.22 - 2026-07-14. Runs on Windows PowerShell 5.1 or PowerShell 7+.
     Requires the relevant module installed for whichever service you connect to.
 #>
 
@@ -479,8 +479,25 @@ $recipientLookup = @{
     Run   = {
         param($term)
         $t = "$term".Replace("'","''")   # escape quotes so O'Brien-type names can't break/inject the OPATH filter
-        Get-EXORecipient -ResultSize 25 -Filter "DisplayName -like '*$t*' -or PrimarySmtpAddress -like '*$t*'" -ErrorAction Stop |
-            ForEach-Object { [pscustomobject]@{ Display = ('{0}  <{1}>  [{2}]' -f $_.DisplayName, $_.PrimarySmtpAddress, $_.RecipientTypeDetails); Value = [string]$_.PrimarySmtpAddress } }
+        $rows = $null
+        try {
+            $rows = Get-EXORecipient -ResultSize 25 -Filter "DisplayName -like '*$t*' -or PrimarySmtpAddress -like '*$t*'" -ErrorAction Stop
+        } catch {
+            # The escape stops injection, but EXO's OPATH -like still rejects an
+            # apostrophe sitting between wildcards ("Invalid wildcard in between").
+            # Fall back to a server query on the safe PREFIX (text before the first
+            # apostrophe) and refine client-side, where the apostrophe is just an
+            # ordinary character - so an O'Brien/D'Angelo search still returns hits.
+            $prefix = ($term -split "'",2)[0]
+            $pEsc   = "$prefix".Replace("'","''")
+            $rows = if ($prefix) {
+                Get-EXORecipient -ResultSize 100 -Filter "DisplayName -like '*$pEsc*' -or PrimarySmtpAddress -like '*$pEsc*'" -ErrorAction Stop
+            } else {
+                Get-EXORecipient -ResultSize 100 -ErrorAction Stop
+            }
+            $rows = @($rows | Where-Object { $_.DisplayName -like "*$term*" -or "$($_.PrimarySmtpAddress)" -like "*$term*" } | Select-Object -First 25)
+        }
+        $rows | ForEach-Object { [pscustomobject]@{ Display = ('{0}  <{1}>  [{2}]' -f $_.DisplayName, $_.PrimarySmtpAddress, $_.RecipientTypeDetails); Value = [string]$_.PrimarySmtpAddress } }
     }
     # Resolve an EXACT typed value to a real recipient (or $null if it doesn't exist).
     Resolve = { param($v) Get-EXORecipient -Identity $v -ErrorAction SilentlyContinue | Select-Object -First 1 }
@@ -554,14 +571,20 @@ function Get-MenuChoice {
         try { $w = $Host.UI.RawUI.WindowSize.Width; if ($w -gt 20) { $winW = $w } } catch {}
         $colW = (($labels | Measure-Object -Property Length -Maximum).Maximum) + 3
         $cols = [Math]::Max(1, [Math]::Floor(($winW - 2) / $colW))
-        $rowsN = [Math]::Ceiling($Options.Count / $cols)
-        for ($r = 0; $r -lt $rowsN; $r++) {
-            $line = ''
-            for ($c = 0; $c -lt $cols; $c++) {
-                $idx = $r * $cols + $c
-                if ($idx -lt $labels.Count) { $line += $labels[$idx].PadRight($colW) }
+        # Only lay out a grid when 2+ columns actually fit. When the labels are so
+        # wide that just one column fits, $cols falls back to 1 and we let the
+        # single-column block below render it - otherwise the list prints twice
+        # (once here as a 1-wide grid, once below).
+        if ($cols -gt 1) {
+            $rowsN = [Math]::Ceiling($Options.Count / $cols)
+            for ($r = 0; $r -lt $rowsN; $r++) {
+                $line = ''
+                for ($c = 0; $c -lt $cols; $c++) {
+                    $idx = $r * $cols + $c
+                    if ($idx -lt $labels.Count) { $line += $labels[$idx].PadRight($colW) }
+                }
+                Write-Host ('  ' + $line.TrimEnd())
             }
-            Write-Host ('  ' + $line.TrimEnd())
         }
     }
     if ($cols -eq 1) {
@@ -661,6 +684,27 @@ function Format-CommandPreview {
         }
     }
     $sb.ToString()
+}
+
+# ---------------------------------------------------------------------------
+# Print a built command line in colour so the cmdlet, its -parameters, and their
+# values are easy to tell apart. Cmdlet = Cyan, -Params = Yellow, values = White.
+# Splits only on ' -Param' boundaries, so quoted values with spaces stay intact.
+# Cosmetic only - logging/undo files still use the plain Format-CommandPreview string.
+# ---------------------------------------------------------------------------
+function Write-CommandColored {
+    param([Parameter(Mandatory)] [string] $Command, [string] $Indent = '  ')
+    Write-Host $Indent -NoNewline
+    $rest = $Command
+    if ($Command -match '^(\S+)(.*)$') {
+        Write-Host $Matches[1] -ForegroundColor Cyan -NoNewline
+        $rest = $Matches[2]
+    }
+    foreach ($p in [regex]::Split($rest, '(\s-[A-Za-z][\w]*)')) {
+        if ($p -match '^\s-[A-Za-z][\w]*$') { Write-Host $p -ForegroundColor Yellow -NoNewline }
+        else                                { Write-Host $p -ForegroundColor White  -NoNewline }
+    }
+    Write-Host ''
 }
 
 # ---------------------------------------------------------------------------
@@ -985,7 +1029,7 @@ function Invoke-GuidedCmdlet {
     $preview = Format-CommandPreview -Cmdlet $Cmdlet -BoundParams $bound -Secret @($secretKeys)
     Write-Host ''
     Write-Host 'Preview (dry-run):' -ForegroundColor Yellow
-    Write-Host ('  ' + $preview) -ForegroundColor White
+    Write-CommandColored -Command $preview
 
     if ($DryRunOnly) {
         Write-Host 'DryRunOnly is set - not executing.' -ForegroundColor White
@@ -995,7 +1039,7 @@ function Invoke-GuidedCmdlet {
     # Last confirmation: repeat the EXACT command, then require an explicit y.
     Write-Host ''
     Write-Host 'FINAL CONFIRMATION - about to execute this command:' -ForegroundColor Yellow
-    Write-Host ('  ' + $preview) -ForegroundColor White
+    Write-CommandColored -Command $preview
     # Destructive cmdlets have no automatic undo (the safety net only covers Set-*),
     # and any cmdlet can reach this point via "Run any command". Demand a deliberate
     # typed confirmation for destructive verbs instead of a one-key y.
@@ -1026,7 +1070,7 @@ function Invoke-GuidedCmdlet {
             $revCmd = Format-CommandPreview -Cmdlet $Cmdlet -BoundParams $rb -Secret @($secretKeys)
             Write-Host ''
             Write-Host 'To undo this change, run:' -ForegroundColor Yellow
-            Write-Host ('  ' + $revCmd) -ForegroundColor White
+            Write-CommandColored -Command $revCmd
             try {
                 $undoDir = Join-Path $script:ToolkitHome 'logs'
                 if (-not (Test-Path $undoDir)) { New-Item -ItemType Directory -Path $undoDir | Out-Null }
@@ -1043,6 +1087,11 @@ function Invoke-GuidedCmdlet {
                 Protect-LocalPath -Path $undoFile
                 Write-Host ('  (also saved to {0})' -f $undoFile) -ForegroundColor White
             } catch {}
+            # Stash the built revert (already a bindable splat) so the user can run
+            # it ON DEMAND from the "What next?" menu - no prompt after every change,
+            # and no retyping/pasting the command (the tool has no paste-a-command
+            # entry by design). Each successful Set replaces the previous stash.
+            $script:LastRevert = @{ Cmdlet = $Cmdlet; Splat = $rb; Preview = $revCmd }
         }
         # Optional per-action projection: reshape a raw/cluttered result into clean,
         # readable columns (e.g. flatten Get-MgUserMemberOf into Name/Email/Type)
@@ -1176,14 +1225,14 @@ function Invoke-BulkCmdlet {
     $preview = Format-CommandPreview -Cmdlet $Cmdlet -BoundParams (& $buildRow $rows[0])
     Write-Host ''
     Write-Host ('Preview - first of {0} rows (dry-run):' -f $rows.Count) -ForegroundColor Yellow
-    Write-Host ('  ' + $preview) -ForegroundColor White
+    Write-CommandColored -Command $preview
 
     if ($DryRunOnly) { Write-Host 'DryRunOnly is set - not executing.' -ForegroundColor White; return }
 
     # Last confirmation before running every row.
     Write-Host ''
     Write-Host ('FINAL CONFIRMATION - about to run this for ALL {0} rows, e.g.:' -f $rows.Count) -ForegroundColor Yellow
-    Write-Host ('  ' + $preview) -ForegroundColor White
+    Write-CommandColored -Command $preview
     if ((Read-Host ("Execute for all {0} rows now? (y/n)" -f $rows.Count)) -notmatch '^(y|yes)$') {
         Write-Host 'Cancelled - nothing was run.' -ForegroundColor White; return
     }
@@ -1337,7 +1386,8 @@ function Read-ParameterValue {
                 Write-Host '  permission entry on this calendar - so there is nothing to change or remove here.' -ForegroundColor Yellow
                 $alt = Get-MenuChoice -Title '  What do you want to do?' `
                             -Options @('Cancel this action','Type an address manually anyway') -AllowBack
-                if (-not $alt -or $alt -eq 'Cancel this action') { $script:ParamCancel = $true; return $null }
+                if (-not $alt)                     { $script:ParamBack   = $true; return $null }  # 0/Back = re-pick the calendar (previous field)
+                if ($alt -eq 'Cancel this action') { $script:ParamCancel = $true; return $null }
                 # 'Type an address manually anyway' -> fall through to the normal prompt below.
             }
             else {
@@ -1627,8 +1677,32 @@ function Show-WhoAmI {
 # category menu for this service), 'switch' (pick another service), or 'quit'.
 # ---------------------------------------------------------------------------
 function Get-NextStep {
-    switch (Get-MenuChoice -Title 'What next?' -Options @(
-                'Do another task (same service)','Switch service','Quit')) {
+    $opts = @('Do another task (same service)','Switch service','Quit')
+    # Only surface an undo when the last Set produced a runnable revert. It is
+    # opt-in here rather than a prompt after every command.
+    if ($script:LastRevert) {
+        $opts = @(('Undo the last change ({0})' -f $script:LastRevert.Cmdlet)) + $opts
+    }
+    $choice = Get-MenuChoice -Title 'What next?' -Options $opts
+    if ($choice -like 'Undo the last change*') {
+        $rv = $script:LastRevert
+        Write-Host ''
+        Write-Host 'Reverting with:' -ForegroundColor Yellow
+        Write-CommandColored -Command $rv.Preview
+        if ((Read-Host 'Run this undo now? (y/n)') -match '^(y|yes)$') {
+            Write-Host 'Reverting...' -ForegroundColor White
+            try {
+                $rvSplat = $rv.Splat
+                & $rv.Cmdlet @rvSplat -ErrorAction Stop | Out-Null
+                Write-Host 'Reverted.' -ForegroundColor Green
+                $script:LastRevert = $null   # consumed - don't offer the same undo again
+            } catch {
+                Write-Host ('Revert failed: {0}' -f $_.Exception.Message) -ForegroundColor Red
+            }
+        }
+        return Get-NextStep   # re-show the menu after handling the undo
+    }
+    switch ($choice) {
         'Switch service' { 'switch' }
         'Quit'           { 'quit' }
         default          { 'again' }
@@ -1687,7 +1761,7 @@ function Start-M365Toolkit {
     Start-Transcript -Path $script:LogFile -Append | Out-Null
     try {
         Write-Host '=====================================================' -ForegroundColor White
-        Write-Host '  Microsoft 365 Guided Command Builder  (v0.21)'       -ForegroundColor White
+        Write-Host '  Microsoft 365 Guided Command Builder  (v0.22)'       -ForegroundColor White
         Write-Host '=====================================================' -ForegroundColor White
 
         $cfg = Get-ToolkitConfig
