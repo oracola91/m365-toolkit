@@ -16,7 +16,7 @@
       3. $Actions   - plain-language catalogue: friendly label -> cmdlet.
 
 .NOTES
-    v0.20 - 2026-07-13. Runs on Windows PowerShell 5.1 or PowerShell 7+.
+    v0.21 - 2026-07-14. Runs on Windows PowerShell 5.1 or PowerShell 7+.
     Requires the relevant module installed for whichever service you connect to.
 #>
 
@@ -181,7 +181,7 @@ $calendarUserCandidates = { param($bound)
 # ---------------------------------------------------------------------------
 $Actions = @(
     [pscustomobject]@{
-        Service='Exchange Online'; Category='Give access'
+        Id='mbx-give-access'; Service='Exchange Online'; Category='Give access'
         Label='Give a user access to another mailbox (incl. shared mailboxes)'
         Cmdlet='Add-MailboxPermission'; Prompt=@('Identity','User','AccessRights')
         Help='Grant ONE person the right to open/manage ANOTHER mailbox (a colleague''s or a shared mailbox). For a shared mailbox pick FullAccess; to control whether it auto-appears in their Outlook, set the optional AutoMapping parameter.'
@@ -193,7 +193,7 @@ $Actions = @(
         }
     }
     [pscustomobject]@{
-        Service='Exchange Online'; Category='Remove & change access'
+        Id='mbx-remove-access'; Service='Exchange Online'; Category='Remove & change access'
         Label='Remove a user''s access to a mailbox'
         Cmdlet='Remove-MailboxPermission'; Prompt=@('Identity','User','AccessRights')
         Help='Take away access that was previously granted.'
@@ -204,7 +204,7 @@ $Actions = @(
         }
     }
     [pscustomobject]@{
-        Service='Exchange Online'; Category='Give access'
+        Id='mbx-give-sendas'; Service='Exchange Online'; Category='Give access'
         Label='Let a user send AS another mailbox (Send As)'
         Cmdlet='Add-RecipientPermission'; Prompt=@('Identity','Trustee')
         Preset=@{ AccessRights='SendAs' }
@@ -215,21 +215,21 @@ $Actions = @(
         }
     }
     [pscustomobject]@{
-        Service='Exchange Online'; Category='Check access'
+        Id='mbx-check-sendas'; Service='Exchange Online'; Category='Check access'
         Label='See who can Send As a mailbox'
         Cmdlet='Get-RecipientPermission'; Prompt=@('Identity')
         Help='List everyone who has Send As on a mailbox - use it to verify a Send As grant.'
         ParamHelp=@{ Identity='The mailbox to check - the one others may send email AS' }
     }
     [pscustomobject]@{
-        Service='Exchange Online'; Category='Check access'
+        Id='mbx-check-access'; Service='Exchange Online'; Category='Check access'
         Label='See who has access to a mailbox (FullAccess etc.)'
         Cmdlet='Get-MailboxPermission'; Prompt=@('Identity')
         Help='List who can open/manage a mailbox. NOTE: "NT AUTHORITY\SELF" and inherited rows are normal system entries - the real grants are the named users.'
         ParamHelp=@{ Identity='The mailbox to check - whose access list you want to see' }
     }
     [pscustomobject]@{
-        Service='Exchange Online'; Category='Check access'
+        Id='mail-groups-of-user'; Service='Exchange Online'; Category='Check access'
         Label='See which mail groups a user is in'
         Cmdlet='Get-Recipient'; Prompt=@('Filter')
         Preset=@{ ResultSize='Unlimited' }
@@ -262,7 +262,7 @@ $Actions = @(
         }
     }
     [pscustomobject]@{
-        Service='Exchange Online'; Category='Check access'
+        Id='dg-list-members'; Service='Exchange Online'; Category='Check access'
         Label='See who is in a distribution group'
         Cmdlet='Get-DistributionGroupMember'; Prompt=@('Identity')
         Preset=@{ ResultSize='Unlimited' }
@@ -285,7 +285,7 @@ $Actions = @(
         }
     }
     [pscustomobject]@{
-        Service='Exchange Online'; Category='Check access'
+        Id='mbx-check-shared-access'; Service='Exchange Online'; Category='Check access'
         Label='See which shared mailboxes a user can access'
         Cmdlet='Get-UserSharedMailboxAccess'; Prompt=@('User')
         Help='List the shared mailboxes a user has FullAccess to. Scans all shared mailboxes, so it can take a minute on large tenants. Type the person; find / last work.'
@@ -297,7 +297,7 @@ $Actions = @(
         }
     }
     [pscustomobject]@{
-        Service='Exchange Online'; Category='Check access'
+        Id='cal-check-access'; Service='Exchange Online'; Category='Check access'
         Label='See who has access to a calendar'
         Cmdlet='Get-MailboxFolderPermission'; Prompt=@('Identity')
         Transform=@{ Identity = { param($v) '{0}:\Calendar' -f $v } }
@@ -305,7 +305,7 @@ $Actions = @(
         ParamHelp=@{ Identity='The mailbox whose calendar you want to check (email or name) - the tool targets its \Calendar folder automatically' }
     }
     [pscustomobject]@{
-        Service='Exchange Online'; Category='Give access'
+        Id='cal-give-access'; Service='Exchange Online'; Category='Give access'
         Label='Give a user access to a calendar'
         Cmdlet='Add-MailboxFolderPermission'; Prompt=@('Identity','User','AccessRights')
         Transform=@{ Identity = { param($v) '{0}:\Calendar' -f $v } }
@@ -318,7 +318,7 @@ $Actions = @(
         }
     }
     [pscustomobject]@{
-        Service='Exchange Online'; Category='Remove & change access'
+        Id='cal-change-access'; Service='Exchange Online'; Category='Remove & change access'
         Label='Change a user''s calendar access'
         Cmdlet='Set-MailboxFolderPermission'; Prompt=@('Identity','User','AccessRights')
         Transform=@{ Identity = { param($v) '{0}:\Calendar' -f $v } }
@@ -332,7 +332,7 @@ $Actions = @(
         }
     }
     [pscustomobject]@{
-        Service='Exchange Online'; Category='Remove & change access'
+        Id='cal-remove-access'; Service='Exchange Online'; Category='Remove & change access'
         Label='Remove a user''s calendar access'
         Cmdlet='Remove-MailboxFolderPermission'; Prompt=@('Identity','User')
         Transform=@{ Identity = { param($v) '{0}:\Calendar' -f $v } }
@@ -344,18 +344,18 @@ $Actions = @(
         }
     }
     [pscustomobject]@{
-        Service='Exchange Online'; Category='Mailboxes'; Label='Look up a mailbox'
+        Id='mbx-lookup'; Service='Exchange Online'; Category='Mailboxes'; Label='Look up a mailbox'
         Cmdlet='Get-EXOMailbox'; Prompt=@('Identity')
         Help='Show details about a mailbox.'
         ParamHelp=@{ Identity='The mailbox to look up (email address or name)' }
     }
     [pscustomobject]@{
-        Service='Exchange Online'; Category='Mailboxes'; Label='Change a mailbox setting'
+        Id='mbx-set-setting'; Service='Exchange Online'; Category='Mailboxes'; Label='Change a mailbox setting'
         Cmdlet='Set-Mailbox'; Prompt=$null
         Help='Change a setting on a mailbox (advanced - walks all available options).'
     }
     [pscustomobject]@{
-        Service='Exchange Online'; Category='Mailboxes'
+        Id='mbx-create-shared'; Service='Exchange Online'; Category='Mailboxes'
         Label='Create a new shared mailbox'
         Cmdlet='New-Mailbox'; Prompt=@('Name','DisplayName','PrimarySmtpAddress')
         Preset=@{ Shared=$true }
@@ -367,7 +367,7 @@ $Actions = @(
         }
     }
     [pscustomobject]@{
-        Service='Exchange Online'; Category='Mailboxes'
+        Id='mbx-convert-to-shared'; Service='Exchange Online'; Category='Mailboxes'
         Label='Convert an existing mailbox to shared'
         Cmdlet='Set-Mailbox'; Prompt=@('Identity')
         Preset=@{ Type='Shared' }
@@ -375,7 +375,7 @@ $Actions = @(
         ParamHelp=@{ Identity='The mailbox to convert (email address or name)' }
     }
     [pscustomobject]@{
-        Service='Exchange Online'; Category='Mailboxes'
+        Id='mbx-convert-to-regular'; Service='Exchange Online'; Category='Mailboxes'
         Label='Convert a shared mailbox back to a regular (user) mailbox'
         Cmdlet='Set-Mailbox'; Prompt=@('Identity')
         Preset=@{ Type='Regular' }
@@ -383,19 +383,19 @@ $Actions = @(
         ParamHelp=@{ Identity='The shared mailbox to convert back (email address or name)' }
     }
     [pscustomobject]@{
-        Service='Exchange Online'; Category='Give access'; Label='Add a member to a distribution group'
+        Id='dg-add-member'; Service='Exchange Online'; Category='Give access'; Label='Add a member to a distribution group'
         Cmdlet='Add-DistributionGroupMember'; Prompt=@('Identity','Member')
         Help='Add someone to a distribution / mailing group.'
         ParamHelp=@{ Identity='The group to add TO'; Member='The person being ADDED' }
     }
     [pscustomobject]@{
-        Service='Entra / Identity (Graph)'; Category='Users'; Label='Look up a user'
+        Id='user-lookup'; Service='Entra / Identity (Graph)'; Category='Users'; Label='Look up a user'
         Cmdlet='Get-MgUser'; Prompt=@('UserId')
         Help='Show details about a user account.'
         ParamHelp=@{ UserId='The user to look up (email or object id)' }
     }
     [pscustomobject]@{
-        Service='Entra / Identity (Graph)'; Category='Check access'
+        Id='user-groups-membership'; Service='Entra / Identity (Graph)'; Category='Check access'
         Label='See which groups a user is in'
         Cmdlet='Get-MgUserMemberOf'; Prompt=@('UserId')
         Preset=@{ All=$true }
@@ -432,21 +432,29 @@ $Actions = @(
         }
     }
     [pscustomobject]@{
-        Service='SharePoint Admin (SPO)'; Category='Sites'; Label='List all SharePoint sites'
+        Id='spo-list-sites'; Service='SharePoint Admin (SPO)'; Category='Sites'; Label='List all SharePoint sites'
         Cmdlet='Get-SPOSite'; Prompt=$null
         Help='List the site collections in the tenant (add -Limit All to see every one).'
     }
     [pscustomobject]@{
-        Service='Intune / Devices (Graph)'; Category='Devices'; Label='List enrolled devices'
+        Id='intune-list-devices'; Service='Intune / Devices (Graph)'; Category='Devices'; Label='List enrolled devices'
         Cmdlet='Get-MgDeviceManagementManagedDevice'; Prompt=$null
         Help='List devices enrolled in Intune.'
     }
     [pscustomobject]@{
-        Service='Power Platform (admin)'; Category='Environments'; Label='List Power Platform environments'
+        Id='pp-list-environments'; Service='Power Platform (admin)'; Category='Environments'; Label='List Power Platform environments'
         Cmdlet='Get-AdminPowerAppEnvironment'; Prompt=$null
         Help='List the Power Platform environments in the tenant.'
     }
 )
+
+# Identity guard (parse time): actions are dispatched by their stable Id, so a
+# duplicated or missing Id would silently route to the wrong action. Fail loud
+# here - before the tool ever runs - so a contributor sees it immediately.
+$dupeIds = $Actions | Group-Object Id | Where-Object Count -gt 1
+if ($dupeIds) { throw ("Action catalogue has duplicate Id(s): {0}. Ids must be unique." -f (($dupeIds.Name) -join '; ')) }
+$missingId = $Actions | Where-Object { [string]::IsNullOrWhiteSpace($_.Id) }
+if ($missingId) { throw ("Action(s) missing an Id: {0}" -f (($missingId.Label) -join '; ')) }
 
 # ---------------------------------------------------------------------------
 # Optional value hints. Some cmdlets have a fixed set of allowed values but do
@@ -1679,7 +1687,7 @@ function Start-M365Toolkit {
     Start-Transcript -Path $script:LogFile -Append | Out-Null
     try {
         Write-Host '=====================================================' -ForegroundColor White
-        Write-Host '  Microsoft 365 Guided Command Builder  (v0.20)'       -ForegroundColor White
+        Write-Host '  Microsoft 365 Guided Command Builder  (v0.21)'       -ForegroundColor White
         Write-Host '=====================================================' -ForegroundColor White
 
         $cfg = Get-ToolkitConfig
@@ -1738,13 +1746,20 @@ function Start-M365Toolkit {
                         $hits = @($svcActions | Where-Object { $_.Label -match $rx -or $_.Cmdlet -match $rx -or $_.Category -match $rx } | Sort-Object Label)   # results A-Z
                         if ($hits.Count -eq 0) { Write-Host "No actions match '$kw'." -ForegroundColor Yellow }
                         else {
+                            $shown = @($hits)   # the exact objects whose labels are displayed, same order
                             $lbl = Get-MenuChoice -Title "Actions matching '$kw'" `
-                                        -Options $hits.Label `
-                                        -Descriptions @($hits | ForEach-Object { [string]$_.Help }) -AllowBack
+                                        -Options @($shown.Label) `
+                                        -Descriptions @($shown | ForEach-Object { [string]$_.Help }) -AllowBack
                             if ($lbl) {
-                                $post = Invoke-Action -Action ($hits | Where-Object { $_.Label -eq $lbl } | Select-Object -First 1)
-                                if ($post -eq 'quit')   { $quit = $true; break }
-                                if ($post -eq 'switch') { break }
+                                # Map the chosen label back to its object by position, then
+                                # dispatch by the object's stable Id - never re-match on Label.
+                                $idx = [array]::IndexOf(@($shown.Label), $lbl)
+                                $action = if ($idx -ge 0) { $shown[$idx] } else { $null }
+                                if ($action) {
+                                    $post = Invoke-Action -Action $action
+                                    if ($post -eq 'quit')   { $quit = $true; break }
+                                    if ($post -eq 'switch') { break }
+                                }
                             }
                         }
                     }
@@ -1808,14 +1823,18 @@ function Start-M365Toolkit {
                     continue
                 }
 
-                $catActions = @($svcActions | Where-Object { $_.Category -eq $cat } | Sort-Object Label)   # actions A-Z
+                $shown = @($svcActions | Where-Object { $_.Category -eq $cat } | Sort-Object Label)   # exact displayed objects, A-Z
                 $label = Get-MenuChoice -Title "[$svcName / $cat] Choose an action" `
-                            -Options $catActions.Label `
-                            -Descriptions @($catActions | ForEach-Object { [string]$_.Help }) `
+                            -Options @($shown.Label) `
+                            -Descriptions @($shown | ForEach-Object { [string]$_.Help }) `
                             -AllowBack
                 if (-not $label) { continue }
 
-                $action = $catActions | Where-Object { $_.Label -eq $label } | Select-Object -First 1
+                # Map the chosen label back to its object by position, then dispatch
+                # by the object's stable Id - never re-match on the Label string.
+                $idx = [array]::IndexOf(@($shown.Label), $label)
+                $action = if ($idx -ge 0) { $shown[$idx] } else { $null }
+                if (-not $action) { continue }
                 $post = Invoke-Action -Action $action
                 if ($post -eq 'quit')   { $quit = $true; break }
                 if ($post -eq 'switch') { break }
