@@ -64,20 +64,26 @@ cd M365Toolkit
 
 ### Run it remotely (once the repo is public)
 
-No local copy needed — open PowerShell and run one line:
+> **⚠️ Security note.** `irm … | iex` downloads and runs a script directly in your
+> admin session — the same trust model as `curl … | bash`. **Read the script first**,
+> and pin the URL to a **specific release tag** (not the moving `main` branch) so you
+> always run a known, reviewed version. Cloning the repo and running the local file is
+> the safer default for an admin tool; use the one-liner only when you understand it.
+
+Pinned to a release tag (recommended — replace `v0.24` with the tag you reviewed):
 
 ```powershell
-irm https://raw.githubusercontent.com/oracola91/m365-toolkit/main/Invoke-M365Toolkit.ps1 | iex
+irm https://raw.githubusercontent.com/oracola91/m365-toolkit/v0.24/Invoke-M365Toolkit.ps1 | iex
 ```
 
 For the safe dry-run preview mode over the network:
 
 ```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/oracola91/m365-toolkit/main/Invoke-M365Toolkit.ps1))) -DryRunOnly
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/oracola91/m365-toolkit/v0.24/Invoke-M365Toolkit.ps1))) -DryRunOnly
 ```
 
 Run this way there is no local file, so logs and CSV exports go to `%USERPROFILE%\M365Toolkit\`.
-The raw URL is CDN-cached for a few minutes, so a fresh push isn't instantly live. (The repo is
+Using a tag (not `main`) also avoids the CDN-cache lag on fresh pushes. (The repo is
 private for now — this works once it's switched to public.)
 
 If a required module isn't installed, the tool offers to install it for the current user.

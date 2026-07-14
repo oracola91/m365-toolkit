@@ -16,7 +16,7 @@
       3. $Actions   - plain-language catalogue: friendly label -> cmdlet.
 
 .NOTES
-    v0.23 - 2026-07-14. Engine runs on PowerShell 7+ (Windows/macOS/Linux) and
+    v0.24 - 2026-07-14. Engine runs on PowerShell 7+ (Windows/macOS/Linux) and
     Windows PowerShell 5.1. Per service: Exchange, Purview, Entra, Intune and Teams
     work everywhere; SharePoint (PnP) needs pwsh 7.2+; SharePoint Admin (SPO) and
     Power Platform use Windows-only modules and run on Windows only.
@@ -91,7 +91,7 @@ $Services = @(
         Module      = 'Microsoft.Online.SharePoint.PowerShell'
         ConnectCmd  = 'Connect-SPOService'
         # Tenant admin cmdlets (Get-SPOSite, Set-SPOTenant...). Needs the -admin URL.
-        ConnectArgs = { param($Upn) @{ Url = (Read-Host 'SharePoint ADMIN URL (e.g. https://shelly-admin.sharepoint.com)') } }
+        ConnectArgs = { param($Upn) @{ Url = (Read-Host 'SharePoint ADMIN URL (e.g. https://contoso-admin.sharepoint.com)') } }
         Disconnect  = 'Disconnect-SPOService'
         WinOnly     = $true   # Microsoft.Online.SharePoint.PowerShell is a .NET Framework (Windows-only) module
     }
@@ -368,7 +368,7 @@ $Actions = @(
         ParamHelp=@{
             Name               = 'Internal name / alias, no spaces (e.g. sales)'
             DisplayName        = 'Friendly name shown to people (e.g. Sales Team)'
-            PrimarySmtpAddress = 'The email address for it (e.g. sales@shelly.com)'
+            PrimarySmtpAddress = 'The email address for it (e.g. sales@contoso.com)'
         }
     }
     [pscustomobject]@{
@@ -490,17 +490,19 @@ $recipientLookup = @{
         } catch {
             # The escape stops injection, but EXO's OPATH -like still rejects an
             # apostrophe sitting between wildcards ("Invalid wildcard in between").
-            # Fall back to a server query on the safe PREFIX (text before the first
-            # apostrophe) and refine client-side, where the apostrophe is just an
-            # ordinary character - so an O'Brien/D'Angelo search still returns hits.
-            $prefix = ($term -split "'",2)[0]
-            $pEsc   = "$prefix".Replace("'","''")
-            $rows = if ($prefix) {
-                Get-EXORecipient -ResultSize 100 -Filter "DisplayName -like '*$pEsc*' -or PrimarySmtpAddress -like '*$pEsc*'" -ErrorAction Stop
-            } else {
-                Get-EXORecipient -ResultSize 100 -ErrorAction Stop
-            }
-            $rows = @($rows | Where-Object { $_.DisplayName -like "*$term*" -or "$($_.PrimarySmtpAddress)" -like "*$term*" } | Select-Object -First 25)
+            # Only that case gets the fallback - auth/throttling/network errors are
+            # re-thrown, not masked behind a second broad query.
+            if ("$($_.Exception.Message)" -notmatch 'wildcard') { throw }
+            # Query the server on the MOST SELECTIVE alphanumeric chunk of the term
+            # (e.g. "Brien" from "O'Brien", not "O" - so we don't pull a huge, capped
+            # result set that might not even contain the target) then refine
+            # client-side, where the apostrophe is just an ordinary character.
+            $token = ($term -split "[^A-Za-z0-9]+" | Where-Object { $_ } | Sort-Object { $_.Length } -Descending | Select-Object -First 1)
+            if (-not $token) { return }   # nothing searchable (term was only punctuation)
+            $tkEsc = "$token".Replace("'","''")
+            $rows = @(Get-EXORecipient -ResultSize 200 -Filter "DisplayName -like '*$tkEsc*' -or PrimarySmtpAddress -like '*$tkEsc*'" -ErrorAction Stop |
+                        Where-Object { $_.DisplayName -like "*$term*" -or "$($_.PrimarySmtpAddress)" -like "*$term*" } |
+                        Select-Object -First 25)
         }
         $rows | ForEach-Object { [pscustomobject]@{ Display = ('{0}  <{1}>  [{2}]' -f $_.DisplayName, $_.PrimarySmtpAddress, $_.RecipientTypeDetails); Value = [string]$_.PrimarySmtpAddress } }
     }
@@ -713,9 +715,22 @@ function Write-CommandColored {
         Write-Host $Matches[1] -ForegroundColor Cyan -NoNewline
         $rest = $Matches[2]
     }
-    foreach ($p in [regex]::Split($rest, '(\s-[A-Za-z][\w]*)')) {
-        if ($p -match '^\s-[A-Za-z][\w]*$') { Write-Host $p -ForegroundColor Yellow -NoNewline }
-        else                                { Write-Host $p -ForegroundColor White  -NoNewline }
+    # Walk char-by-char tracking quote state, so a "-word" sitting INSIDE a quoted
+    # value (e.g. -Filter 'Members -eq ...') is not mistaken for a real -Parameter.
+    $i = 0; $n = $rest.Length; $quote = $null
+    while ($i -lt $n) {
+        $ch = $rest[$i]
+        if (-not $quote -and [char]::IsWhiteSpace($ch) -and ($i + 2) -lt $n -and $rest[$i + 1] -eq '-' -and [char]::IsLetter([char]$rest[$i + 2])) {
+            $j = $i + 2
+            while ($j -lt $n -and ("$($rest[$j])" -match '\w')) { $j++ }
+            Write-Host $rest.Substring($i, $j - $i) -ForegroundColor Yellow -NoNewline
+            $i = $j; continue
+        }
+        if ($ch -eq "'" -or $ch -eq '"') {
+            if (-not $quote) { $quote = $ch } elseif ($quote -eq $ch) { $quote = $null }
+        }
+        Write-Host $ch -ForegroundColor White -NoNewline
+        $i++
     }
     Write-Host ''
 }
@@ -1080,7 +1095,12 @@ function Invoke-GuidedCmdlet {
             $rb = [ordered]@{}
             foreach ($k in $revertPlan.Keys.Keys)   { $rb[$k] = $revertPlan.Keys[$k] }
             foreach ($k in $revertPlan.Before.Keys) { $rb[$k] = $revertPlan.Before[$k] }
-            $revCmd = Format-CommandPreview -Cmdlet $Cmdlet -BoundParams $rb -Secret @($secretKeys)
+            # Mask any revert param whose NAME looks like a secret too - the "before"
+            # values come straight from Get-RevertPlan's Get-* snapshot (not typed by
+            # the user), so they aren't in $secretKeys; without this a credential-ish
+            # property could land unmasked in undo-hints.log / on screen.
+            $revSecret = @($secretKeys) + @($rb.Keys | Where-Object { $_ -match '(?i)(password|passwd|pwd|secret|credential|token|apikey|api[_-]?key|clientsecret|access[_-]?key)' })
+            $revCmd = Format-CommandPreview -Cmdlet $Cmdlet -BoundParams $rb -Secret @($revSecret)
             Write-Host ''
             Write-Host 'To undo this change, run:' -ForegroundColor Yellow
             Write-CommandColored -Command $revCmd
@@ -1351,8 +1371,12 @@ function Read-ParameterValue {
     # $script:ParamSecret tells the caller to mask it in the preview and logs.
     # Mainly a guard for the "Run any command" hatch (the curated catalogue has
     # no secret params). No back/cancel here - you can't type a keyword blind.
-    $isSecret = (-not $isArray) -and ( ($elem -eq [securestring]) -or
-        ($name -match '(?i)(password|passwd|pwd|secret|credential|token|apikey|api[_-]?key|clientsecret|access[_-]?key)') )
+    # NB: no $isArray exclusion - a secret-NAMED array param (e.g. -Passwords) must
+    # still be read hidden rather than echoed through the plain array prompt. Reading
+    # a single masked value for such a param is acceptable (they are vanishingly rare)
+    # and far safer than leaking it to screen/transcript/undo log.
+    $isSecret = ($elem -eq [securestring]) -or
+        ($name -match '(?i)(password|passwd|pwd|secret|credential|token|apikey|api[_-]?key|clientsecret|access[_-]?key)')
     if ($isSecret) {
         while ($true) {
             $sec = Read-Host ("Enter -{0} (hidden){1}" -f $name, $(if ($Required) { ' (required)' } else { ' - or press Enter to skip' })) -AsSecureString
@@ -1659,9 +1683,13 @@ function Save-ToolkitConfig {
     param([string] $Upn, [string] $LastService)
     if (-not (Test-Path $script:ToolkitHome)) { New-Item -ItemType Directory -Path $script:ToolkitHome -Force | Out-Null }
     $cfgPath = Join-Path $script:ToolkitHome 'config.json'
+    # Create the file empty and lock it down BEFORE writing content, so there is no
+    # window where config.json exists with default (possibly group/world-readable)
+    # perms. It only holds a UPN + last-used service, but this closes the TOCTOU gap.
+    if (-not (Test-Path $cfgPath)) { New-Item -ItemType File -Path $cfgPath -Force | Out-Null; Protect-LocalPath -Path $cfgPath }
     [pscustomobject]@{ Upn = $Upn; LastService = $LastService } |
         ConvertTo-Json | Set-Content -Path $cfgPath -Encoding UTF8
-    Protect-LocalPath -Path $cfgPath   # holds UPN + last service (no secrets), but keep it owner-only anyway
+    Protect-LocalPath -Path $cfgPath   # re-assert (also covers the already-existed case)
 }
 
 # ---------------------------------------------------------------------------
@@ -1690,35 +1718,39 @@ function Show-WhoAmI {
 # category menu for this service), 'switch' (pick another service), or 'quit'.
 # ---------------------------------------------------------------------------
 function Get-NextStep {
-    $opts = @('Do another task (same service)','Switch service','Quit')
-    # Only surface an undo when the last Set produced a runnable revert. It is
-    # opt-in here rather than a prompt after every command.
-    if ($script:LastRevert) {
-        $opts = @(('Undo the last change ({0})' -f $script:LastRevert.Cmdlet)) + $opts
-    }
-    $choice = Get-MenuChoice -Title 'What next?' -Options $opts
-    if ($choice -like 'Undo the last change*') {
-        $rv = $script:LastRevert
-        Write-Host ''
-        Write-Host 'Reverting with:' -ForegroundColor Yellow
-        Write-CommandColored -Command $rv.Preview
-        if ((Read-Host 'Run this undo now? (y/n)') -match '^(y|yes)$') {
-            Write-Host 'Reverting...' -ForegroundColor White
-            try {
-                $rvSplat = $rv.Splat
-                & $rv.Cmdlet @rvSplat -ErrorAction Stop | Out-Null
-                Write-Host 'Reverted.' -ForegroundColor Green
-                $script:LastRevert = $null   # consumed - don't offer the same undo again
-            } catch {
-                Write-Host ('Revert failed: {0}' -f $_.Exception.Message) -ForegroundColor Red
-            }
+    # Loop (not recurse) so repeatedly choosing "Undo" - e.g. a scripted/piped
+    # stdin - can't build unbounded call depth.
+    while ($true) {
+        $opts = @('Do another task (same service)','Switch service','Quit')
+        # Only surface an undo when the last Set produced a runnable revert. It is
+        # opt-in here rather than a prompt after every command.
+        if ($script:LastRevert) {
+            $opts = @(('Undo the last change ({0})' -f $script:LastRevert.Cmdlet)) + $opts
         }
-        return Get-NextStep   # re-show the menu after handling the undo
-    }
-    switch ($choice) {
-        'Switch service' { 'switch' }
-        'Quit'           { 'quit' }
-        default          { 'again' }
+        $choice = Get-MenuChoice -Title 'What next?' -Options $opts
+        if ($choice -like 'Undo the last change*') {
+            $rv = $script:LastRevert
+            Write-Host ''
+            Write-Host 'Reverting with:' -ForegroundColor Yellow
+            Write-CommandColored -Command $rv.Preview
+            if ((Read-Host 'Run this undo now? (y/n)') -match '^(y|yes)$') {
+                Write-Host 'Reverting...' -ForegroundColor White
+                try {
+                    $rvSplat = $rv.Splat
+                    & $rv.Cmdlet @rvSplat -ErrorAction Stop | Out-Null
+                    Write-Host 'Reverted.' -ForegroundColor Green
+                    $script:LastRevert = $null   # consumed - don't offer the same undo again
+                } catch {
+                    Write-Host ('Revert failed: {0}' -f $_.Exception.Message) -ForegroundColor Red
+                }
+            }
+            continue   # re-show the menu after handling the undo
+        }
+        switch ($choice) {
+            'Switch service' { return 'switch' }
+            'Quit'           { return 'quit' }
+            default          { return 'again' }
+        }
     }
 }
 
@@ -1774,7 +1806,7 @@ function Start-M365Toolkit {
     Start-Transcript -Path $script:LogFile -Append | Out-Null
     try {
         Write-Host '=====================================================' -ForegroundColor White
-        Write-Host '  Microsoft 365 Guided Command Builder  (v0.23)'       -ForegroundColor White
+        Write-Host '  Microsoft 365 Guided Command Builder  (v0.24)'       -ForegroundColor White
         Write-Host '=====================================================' -ForegroundColor White
 
         $cfg = Get-ToolkitConfig
@@ -1861,8 +1893,14 @@ function Start-M365Toolkit {
                     # whatever this service added on top of the pre-connect baseline.
                     $svcCmds = @(Get-Command -CommandType Cmdlet,Function -ErrorAction SilentlyContinue |
                                     Where-Object { $script:BaselineCommands -notcontains $_.Name })
-                    if ($svcCmds.Count -eq 0) {   # e.g. Graph loads sub-modules on demand - fall back to everything
-                        $svcCmds = @(Get-Command -CommandType Cmdlet,Function -ErrorAction SilentlyContinue)
+                    if ($svcCmds.Count -eq 0) {
+                        # e.g. Graph loads sub-modules on demand, so the baseline diff
+                        # can come back empty. Fall back to the connected service's OWN
+                        # module commands (wildcard covers meta-modules like
+                        # Microsoft.Graph.* that load sub-modules) - NOT every command in
+                        # the session, so the advanced hatch can't reach unrelated local
+                        # system cmdlets (Remove-Item, Stop-Process, ...).
+                        $svcCmds = @(Get-Command -CommandType Cmdlet,Function -Module "$($service.Module)*" -ErrorAction SilentlyContinue)
                     }
                     $verbs = @($svcCmds | ForEach-Object { $_.Verb } | Where-Object { $_ } | Sort-Object -Unique)
                     $cmdName = $null
@@ -1875,7 +1913,11 @@ function Start-M365Toolkit {
                                 $entry = (Read-Host 'Cmdlet name or keyword (Enter to go back)').Trim()
                                 if (-not $entry) { break }
                                 if ($entry -eq '?') { Write-Host 'Type a full cmdlet name to use it, or part of a name to pick from matches.' -ForegroundColor White; continue }
-                                if (Get-Command -Name $entry -ErrorAction SilentlyContinue) { $cmdName = $entry; break }
+                                # Only accept an exact name that belongs to THIS service's
+                                # command set - not any cmdlet loaded in the session - so the
+                                # advanced hatch stays scoped to M365 and can't run arbitrary
+                                # local cmdlets (Remove-Item, Invoke-Expression, ...).
+                                if ($svcCmds.Name -contains $entry) { $cmdName = $entry; break }
                                 $hits = @($svcCmds | Where-Object { $_.Name -like "*$entry*" } | Select-Object -ExpandProperty Name | Sort-Object)
                                 if ($hits.Count -eq 0)  { Write-Host ("Nothing matches '{0}'." -f $entry) -ForegroundColor Yellow; continue }
                                 if ($hits.Count -gt 40) { Write-Host ("'{0}' matches {1} commands - narrow it down." -f $entry, $hits.Count) -ForegroundColor Yellow; continue }

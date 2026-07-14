@@ -47,7 +47,7 @@ The app is an interactive, guided PowerShell "command builder" for Microsoft 365
   `~/M365Toolkit` (lines 34–37). Logs → `logs/session-<timestamp>.log`;
   CSV exports → `exports/<cmdlet>-<timestamp>.csv`; undo hints → `logs/undo-hints.log`.
 - `config.json` stores `Upn` + `LastService` (currently
-  `taner.ibryamov@shelly.com` / `Exchange Online`).
+  `admin@contoso.com` / `Exchange Online`).
 
 **Before each full pass:** back up / note the current `config.json`, and `ls logs/ exports/`
 so you can confirm new files are created.
@@ -68,7 +68,7 @@ so you can confirm new files are created.
 
 **A2 — Remembered UPN default**
 - Objective: Config pre-fills the email prompt.
-- Steps: At `Your email (UPN) [Enter = taner.ibryamov@shelly.com]`, press Enter.
+- Steps: At `Your email (UPN) [Enter = admin@contoso.com]`, press Enter.
 - Expected: The stored UPN is used (lines 1416–1418).
 - Edge: Type a different UPN — it should be used and later saved to `config.json`
   (`Save-ToolkitConfig`, line 1437, only after a successful service selection).
