@@ -16,7 +16,7 @@
       3. $Actions   - plain-language catalogue: friendly label -> cmdlet.
 
 .NOTES
-    v0.25 - 2026-10-25. Engine runs on PowerShell 7+ (Windows/macOS/Linux) and
+    v0.26 - 2026-10-25. Engine runs on PowerShell 7+ (Windows/macOS/Linux) and
     Windows PowerShell 5.1. Per service: Exchange, Purview, Entra, Intune and Teams
     work everywhere; SharePoint (PnP) needs pwsh 7.2+; SharePoint Admin (SPO) and
     Power Platform use Windows-only modules and run on Windows only.
@@ -472,6 +472,10 @@ $ParamHints = @{
     AccessRights = @('FullAccess','ExternalAccount','DeleteItem','ReadPermission','ChangePermission','ChangeOwner')
 }
 
+# Parameter names that look like credentials. One pattern for every place that
+# decides what to read hidden and what to mask (prompts, previews, undo, bulk).
+$script:SecretNamePattern = '(?i)(password|passwd|pwd|secret|credential|token|apikey|api[_-]?key|clientsecret|access[_-]?key)'
+
 # ---------------------------------------------------------------------------
 # Optional target lookups. For identity-style parameters the user can type
 # 'find' to search the directory and pick from a list instead of typing an
@@ -877,6 +881,121 @@ function Get-ParamDescription {
 }
 
 # ---------------------------------------------------------------------------
+# Shared value rules for the guided and bulk runners, so both treat allowed
+# values, booleans, lists, secrets and the run gate the same way.
+# ---------------------------------------------------------------------------
+
+# The fixed set of allowed values for a parameter, from (in order) a
+# [ValidateSet], the values of an enum type, the action's Hints, or the global
+# $ParamHints table. $null when the field is free text.
+function Get-AllowedValues {
+    param([Parameter(Mandatory)] $Param, [hashtable] $Hints)
+    $type = $Param.ParameterType
+    $elem = if ($type.IsArray) { $type.GetElementType() } else { $type }
+    $vset = $Param.Attributes | Where-Object { $_ -is [System.Management.Automation.ValidateSetAttribute] } | Select-Object -First 1
+    if     ($vset)                                       { return ,([string[]]$vset.ValidValues) }
+    elseif ($elem.IsEnum)                                { return ,([string[]][enum]::GetNames($elem)) }
+    elseif ($Hints -and $Hints.ContainsKey($Param.Name)) { return ,([string[]]$Hints[$Param.Name]) }
+    elseif ($ParamHints.ContainsKey($Param.Name))        { return ,([string[]]$ParamHints[$Param.Name]) }
+    return $null
+}
+
+# Secret fields are read hidden and masked in previews and logs: a
+# [SecureString] parameter, or one whose name looks like a credential.
+function Test-SecretParam {
+    param([Parameter(Mandatory)] $Param)
+    $type = $Param.ParameterType
+    $elem = if ($type.IsArray) { $type.GetElementType() } else { $type }
+    return (($elem -eq [securestring]) -or ($Param.Name -match $script:SecretNamePattern))
+}
+
+# Turn text typed at a prompt, or read from a CSV cell, into a value the
+# parameter binder accepts. Returns @{ Ok; Value; Error }. Booleans map yes/no
+# words explicitly ('false' as a string is truthy, so never cast). List fields
+# split on commas only, so "Sales Team" stays one value. Values with an allowed
+# set are checked and normalised to the canonical casing.
+function ConvertTo-ParamValue {
+    param([Parameter(Mandatory)] $Param, [AllowEmptyString()] [string] $Text, [string[]] $Allowed)
+    $type = $Param.ParameterType
+    $elem = if ($type.IsArray) { $type.GetElementType() } else { $type }
+    $t    = $Text.Trim()
+    if ($elem -eq [bool]) {
+        $k = $t.ToLower()
+        if ($k -in @('true','yes','y','1'))  { return @{ Ok = $true; Value = $true } }
+        if ($k -in @('false','no','n','0')) { return @{ Ok = $true; Value = $false } }
+        return @{ Ok = $false; Error = ("'{0}' is not true or false" -f $t) }
+    }
+    $vals = @(if ($type.IsArray) { $t -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ } } else { $t })
+    if ($Allowed) {
+        # -contains is case-insensitive, so 'sendas' passes and is normalised to 'SendAs'.
+        $bad = @($vals | Where-Object { $Allowed -notcontains $_ })
+        if ($bad.Count -gt 0) { return @{ Ok = $false; Error = ("not valid: {0}. Choose from: {1}" -f ($bad -join ', '), ($Allowed -join ', ')) } }
+        $vals = @($vals | ForEach-Object { $v = $_; $Allowed | Where-Object { $_ -eq $v } | Select-Object -First 1 })
+    }
+    if ($type.IsArray) { return @{ Ok = $true; Value = [object[]]$vals } }
+    return @{ Ok = $true; Value = $vals[0] }
+}
+
+# The run gate shared by the guided and bulk runners. Destructive verbs have no
+# automatic undo (the safety net only covers Set-*) and any cmdlet can reach
+# this point via "Run any command", so they need the command name typed - plus
+# the row count in bulk, where one keypress would otherwise hit every row.
+# Everything else needs an explicit y. Returns $true to go ahead.
+function Confirm-Execution {
+    param([Parameter(Mandatory)] [string] $Cmdlet, [int] $RowCount = 0)
+    $destructiveVerbs = @('Remove','Disable','Delete','Reset','Clear','Revoke','Uninstall','Deprovision')
+    $verb = ($Cmdlet -split '-',2)[0]
+    if ($destructiveVerbs -contains $verb) {
+        Write-Host ''
+        if ($RowCount -gt 0) {
+            Write-Host ('[!] {0} is DESTRUCTIVE, has no automatic undo, and will run for {1} row(s).' -f $Cmdlet, $RowCount) -ForegroundColor Red
+            $expect = '{0} {1}' -f $Cmdlet, $RowCount
+        } else {
+            Write-Host ('[!] {0} is DESTRUCTIVE and has no automatic undo.' -f $Cmdlet) -ForegroundColor Red
+            $expect = $Cmdlet
+        }
+        $typed = ("$(Read-Host ('To proceed, type exactly: {0}  (anything else cancels)' -f $expect))".Trim()) -replace '\s+', ' '
+        return ($typed -eq $expect)
+    }
+    $q = if ($RowCount -gt 0) { 'Execute for all {0} row(s) now? (y/n)' -f $RowCount } else { 'Execute it now? (y/n)' }
+    return ((Read-Host $q) -match '^(y|yes)$')
+}
+
+# Read a CSV for the bulk runner. Excel often saves ANSI rather than UTF-8 and,
+# in EU locales, uses ';' as the separator. Decode as strict UTF-8 first; if the
+# bytes are not UTF-8, decode as Windows-1252; if the header has ';' but no ','
+# read with ';'. Says what it did.
+function Import-BulkCsv {
+    param([Parameter(Mandatory)] [string] $Path)
+    $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $Path).ProviderPath)
+    try {
+        $text = [System.Text.UTF8Encoding]::new($false, $true).GetString($bytes)   # strict: throws on bytes that are not UTF-8
+    } catch {
+        $enc = $null
+        try { $enc = [System.Text.Encoding]::GetEncoding(1252) } catch { $enc = [System.Text.Encoding]::GetEncoding('iso-8859-1') }
+        $text = $enc.GetString($bytes)
+        Write-Host ('  The file is not UTF-8 - reading it as {0} (the usual Excel "CSV" encoding).' -f $enc.WebName) -ForegroundColor Yellow
+    }
+    $text   = $text.TrimStart([char]0xFEFF)   # drop a byte order mark
+    $header = ($text -split "`r?`n", 2)[0]
+    $delim  = ','
+    if ($header -notmatch ',' -and $header -match ';') {
+        $delim = ';'
+        Write-Host "  The file uses ';' as the separator - reading it that way." -ForegroundColor Yellow
+    }
+    @($text | ConvertFrom-Csv -Delimiter $delim)
+}
+
+# Replace each given secret value inside a message with ********, so a binder or
+# service error that echoes its input cannot leak a secret to screen or log.
+function Hide-SecretText {
+    param([string] $Text, [string[]] $Values)
+    $out = "$Text"
+    foreach ($v in @($Values | Where-Object { $_ })) { $out = $out.Replace($v, '********') }
+    return $out
+}
+
+# ---------------------------------------------------------------------------
 # Layer 2: the generic introspection engine. Given a cmdlet name it discovers
 # the real parameters, categorises them, prompts in plain language, previews,
 # and runs. Works for ANY cmdlet in ANY connected module - no per-cmdlet code.
@@ -1068,20 +1187,9 @@ function Invoke-GuidedCmdlet {
     Write-Host ''
     Write-Host 'FINAL CONFIRMATION - about to execute this command:' -ForegroundColor Yellow
     Write-CommandColored -Command $preview
-    # Destructive cmdlets have no automatic undo (the safety net only covers Set-*),
-    # and any cmdlet can reach this point via "Run any command". Demand a deliberate
-    # typed confirmation for destructive verbs instead of a one-key y.
-    $destructiveVerbs = @('Remove','Disable','Delete','Reset','Clear','Revoke','Uninstall','Deprovision')
-    $verb = ($Cmdlet -split '-',2)[0]
-    if ($destructiveVerbs -contains $verb) {
-        Write-Host ''
-        Write-Host ('[!] {0} is DESTRUCTIVE and has no automatic undo.' -f $Cmdlet) -ForegroundColor Red
-        $typed = (Read-Host ('To proceed, type the command name exactly ({0}) - anything else cancels' -f $Cmdlet)).Trim()
-        if ($typed -ne $Cmdlet) {
-            Write-Host 'Cancelled - nothing was run.' -ForegroundColor White
-            return
-        }
-    } elseif ((Read-Host 'Execute it now? (y/n)') -notmatch '^(y|yes)$') {
+    # Destructive verbs need the command name typed; everything else an explicit y.
+    # Same gate as the bulk runner (Confirm-Execution).
+    if (-not (Confirm-Execution -Cmdlet $Cmdlet)) {
         Write-Host 'Cancelled - nothing was run.' -ForegroundColor White
         return
     }
@@ -1099,7 +1207,7 @@ function Invoke-GuidedCmdlet {
             # values come straight from Get-RevertPlan's Get-* snapshot (not typed by
             # the user), so they aren't in $secretKeys; without this a credential-ish
             # property could land unmasked in undo-hints.log / on screen.
-            $revSecret = @($secretKeys) + @($rb.Keys | Where-Object { $_ -match '(?i)(password|passwd|pwd|secret|credential|token|apikey|api[_-]?key|clientsecret|access[_-]?key)' })
+            $revSecret = @($secretKeys) + @($rb.Keys | Where-Object { $_ -match $script:SecretNamePattern })
             $revCmd = Format-CommandPreview -Cmdlet $Cmdlet -BoundParams $rb -Secret @($revSecret)
             Write-Host ''
             Write-Host 'To undo this change, run:' -ForegroundColor Yellow
@@ -1141,8 +1249,12 @@ function Invoke-GuidedCmdlet {
 
 # ---------------------------------------------------------------------------
 # Bulk runner: run the SAME cmdlet once per row of a CSV file. You map each
-# parameter to a CSV column (per-row value) or a fixed value (same every row),
-# preview the first row, then it runs them all with a per-row success/fail tally.
+# parameter to a CSV column (per-row value) or a fixed value (same every row).
+# Every row is converted and checked BEFORE anything runs, with the same value
+# rules as the guided path; a blank cell is skipped unless you choose to clear;
+# the targets are listed; and the same run gate applies (a destructive verb needs
+# the command name AND the row count typed). Each row's outcome, and for a Set-*
+# the values it replaced, goes to a results CSV.
 # ---------------------------------------------------------------------------
 function Invoke-BulkCmdlet {
     param(
@@ -1151,14 +1263,19 @@ function Invoke-BulkCmdlet {
         [hashtable] $ParamHelp,
         [hashtable] $Preset,
         [hashtable] $Hints,      # optional per-action allowed-value overrides (name -> values)
-        [hashtable] $Transform   # optional post-processing of each row's values (name -> scriptblock)
+        [hashtable] $Transform,  # optional post-processing of each row's values (name -> scriptblock)
+        [switch]    $Resolve     # check identity values against the directory (catalogued actions; run-any skips it)
     )
     $cmd   = Get-Command $Cmdlet -ErrorAction Stop
     $parts = Get-CmdletParameters -Cmd $cmd -PreferParams $Prompt
+    $byName = @{}
+    foreach ($p in (@($parts.Required) + @($parts.Optional) + @($parts.Switches))) { if ($p) { $byName[$p.Name] = $p } }
+    $requiredNames = @($parts.Required | ForEach-Object { $_.Name })
 
-    $csvPath = (Read-Host 'Path to CSV file (must have a header row)').Trim('"',' ')
-    if (-not (Test-Path $csvPath)) { Write-Host "File not found: $csvPath" -ForegroundColor Red; return }
-    $rows = @(Import-Csv -Path $csvPath)
+    $csvPath = ("$(Read-Host 'Path to CSV file (must have a header row)')").Trim('"',' ')
+    if (-not $csvPath -or -not (Test-Path -LiteralPath $csvPath -PathType Leaf)) { Write-Host "File not found: $csvPath" -ForegroundColor Red; return }
+    try   { $rows = @(Import-BulkCsv -Path $csvPath) }
+    catch { Write-Host ('Could not read that CSV: {0}' -f $_.Exception.Message) -ForegroundColor Red; return }
     if ($rows.Count -eq 0) { Write-Host 'That CSV has no data rows.' -ForegroundColor Yellow; return }
     $columns = @($rows[0].PSObject.Properties.Name)
 
@@ -1166,41 +1283,53 @@ function Invoke-BulkCmdlet {
     Write-Host ("Loaded {0} rows. Columns: {1}" -f $rows.Count, ($columns -join ', ')) -ForegroundColor White
     Write-Host 'For each parameter: type a COLUMN name (uses each row''s value), or =value for a fixed value on every row, or press Enter to skip.' -ForegroundColor White
 
-    # map: paramName -> @{ Kind = 'column' | 'fixed' | 'switch'; Value = ... }
+    # map: paramName -> @{ Kind = 'column' | 'fixed' | 'switch'; Value; Allowed; Secret }
     $map = [ordered]@{}
-    if ($Preset) { foreach ($k in $Preset.Keys) { $map[$k] = @{ Kind='fixed'; Value=$Preset[$k] } } }
+    if ($Preset) {
+        foreach ($k in $Preset.Keys) {
+            $pv = $Preset[$k]
+            # A switch preset written as $true binds and previews as a switch (-Shared), not -Shared $true.
+            if ($pv -is [bool] -and (@($parts.Switches | ForEach-Object { $_.Name }) -contains $k)) {
+                if ($pv) { $map[$k] = @{ Kind = 'switch' } }
+                continue
+            }
+            $map[$k] = @{ Kind = 'fixed'; Value = $pv }
+        }
+    }
 
     $askParam = {
         param($p, $required)
         if ($map.Contains($p.Name)) { return }
         $desc = if ($ParamHelp) { $ParamHelp[$p.Name] } else { $null }
         if ($desc) { Write-Host ("  -> {0}" -f $desc) -ForegroundColor White }
-        # Allowed-value set (ValidateSet / enum / per-action Hints / global ParamHints),
-        # mirroring the guided prompt: shown to the user and used to validate =fixed values.
-        $type = $p.ParameterType; $elem = if ($type.IsArray) { $type.GetElementType() } else { $type }
-        $allowed = $null
-        $vset = $p.Attributes | Where-Object { $_ -is [System.Management.Automation.ValidateSetAttribute] } | Select-Object -First 1
-        if     ($vset)                                    { $allowed = [string[]]$vset.ValidValues }
-        elseif ($elem.IsEnum)                             { $allowed = [string[]][enum]::GetNames($elem) }
-        elseif ($Hints -and $Hints.ContainsKey($p.Name))  { $allowed = [string[]]$Hints[$p.Name] }
-        elseif ($ParamHints.ContainsKey($p.Name))         { $allowed = [string[]]$ParamHints[$p.Name] }
-        if ($allowed) { Write-Host ('     allowed values: ' + ($allowed -join ', ')) -ForegroundColor White }
+        # Same allowed-value and secret rules as the guided prompt.
+        $allowed  = Get-AllowedValues -Param $p -Hints $Hints
+        $isSecret = Test-SecretParam -Param $p
+        if ($allowed)  { Write-Host ('     allowed values: ' + ($allowed -join ', ')) -ForegroundColor White }
+        if ($isSecret) { Write-Host '     secret: map a column, or type = on its own to enter one fixed value hidden' -ForegroundColor White }
         while ($true) {
-            $ans = Read-Host ("Map -{0} (column / =fixed / Enter){1}" -f $p.Name, $(if ($required) { ' [required]' } else { '' }))
+            $ans = "$(Read-Host ("Map -{0} (column / =fixed / Enter){1}" -f $p.Name, $(if ($required) { ' [required]' } else { '' })))"
             if ([string]::IsNullOrWhiteSpace($ans)) {
-                if ($required) { Write-Host '  Required - give a column name or =value.' -ForegroundColor Yellow; continue }
+                if ($required) {
+                    if (Test-InputEnded) { throw [System.IO.EndOfStreamException]::new('No more input (stdin closed).') }
+                    Write-Host '  Required - give a column name or =value.' -ForegroundColor Yellow; continue
+                }
                 return
             }
             if ($ans.StartsWith('=')) {
-                $fv = $ans.Substring(1)
-                # Validate a fixed value against the allowed set (column values are
-                # per-row and can't be checked here). -contains is case-insensitive.
-                if ($allowed -and ($allowed -notcontains $fv)) {
-                    Write-Host ("  '{0}' is not allowed. Choose from: {1}" -f $fv, ($allowed -join ', ')) -ForegroundColor Yellow; continue
+                if ($isSecret) {
+                    # A fixed secret typed after '=' would already be on screen and in the transcript.
+                    if ($ans -ne '=') { Write-Host '  For a secret, type = on its own and enter the value hidden. What you typed was not used.' -ForegroundColor Yellow; continue }
+                    $sec = Read-Host ("Fixed -{0} for every row (hidden)" -f $p.Name) -AsSecureString
+                    $len = 0; try { $len = $sec.Length } catch { }
+                    if ($len -eq 0) { continue }
+                    $map[$p.Name] = @{ Kind = 'fixed'; Value = $sec; Secret = $true }; return
                 }
-                $map[$p.Name] = @{ Kind='fixed'; Value=$fv }; return
+                $conv = ConvertTo-ParamValue -Param $p -Text $ans.Substring(1) -Allowed $allowed
+                if (-not $conv.Ok) { Write-Host ("  {0}." -f $conv.Error) -ForegroundColor Yellow; continue }
+                $map[$p.Name] = @{ Kind = 'fixed'; Value = $conv.Value }; return
             }
-            if ($columns -contains $ans) { $map[$p.Name] = @{ Kind='column'; Value=$ans }; return }
+            if ($columns -contains $ans) { $map[$p.Name] = @{ Kind = 'column'; Value = $ans; Allowed = $allowed; Secret = $isSecret }; return }
             Write-Host ("  '{0}' is not a column. Available: {1}" -f $ans, ($columns -join ', ')) -ForegroundColor Yellow
         }
     }
@@ -1232,57 +1361,212 @@ function Invoke-BulkCmdlet {
         for ($i=0; $i -lt $swRest.Count; $i++) { Write-Host ('  {0,2}. {1}' -f ($i+1), $swRest[$i].Name) }
         $pick = Read-Host 'Enter numbers to enable, or Enter to skip'
         foreach ($n in ($pick -split '[,\s]+' | Where-Object { $_ -match '^\d+$' })) {
-            $idx=[int]$n-1; if ($idx -ge 0 -and $idx -lt $swRest.Count) { $map[$swRest[$idx].Name] = @{ Kind='switch'; Value=$true } }
+            $idx=[int]$n-1; if ($idx -ge 0 -and $idx -lt $swRest.Count) { $map[$swRest[$idx].Name] = @{ Kind = 'switch' } }
         }
     }
+    if ($map.Count -eq 0) { Write-Host 'Nothing mapped - nothing to run.' -ForegroundColor Yellow; return }
 
-    $buildRow = {
-        param($row)
-        $b = [ordered]@{}
+    # Blank cells: in the guided path an empty answer means "skip", so by default a
+    # blank cell skips that parameter on that row. Clearing needs an explicit choice.
+    $blankClears = $false
+    $blankCols = @(foreach ($k in $map.Keys) {
+        $m = $map[$k]
+        if ($m.Kind -ne 'column' -or $requiredNames -contains $k) { continue }
+        $n = @($rows | Where-Object { [string]::IsNullOrWhiteSpace([string]$_.($m.Value)) }).Count
+        if ($n -gt 0) { [pscustomobject]@{ Param = $k; Column = $m.Value; Blank = $n } }
+    })
+    if ($blankCols.Count -gt 0) {
+        Write-Host ''
+        Write-Host 'Some mapped columns have blank cells:' -ForegroundColor Yellow
+        foreach ($bc in $blankCols) { Write-Host ('  -{0} (column {1}): {2} of {3} rows blank' -f $bc.Param, $bc.Column, $bc.Blank, $rows.Count) -ForegroundColor White }
+        $bq = Get-MenuChoice -Title 'What should a blank cell do?' -Options @(
+            'Skip that parameter on that row (nothing changes for it) - recommended',
+            'Send it as empty, to CLEAR the current value')
+        $blankClears = ($bq -like 'Send it as empty*')
+    }
+
+    # Build and check EVERY row before anything runs, with the guided path's rules:
+    # value conversion, allowed values, required fields, and (for catalogued
+    # actions) the directory check on identity fields.
+    $lookupOk = @{}
+    if ($Resolve) {
         foreach ($k in $map.Keys) {
-            $m = $map[$k]
-            switch ($m.Kind) {
-                'column' { $b[$k] = $row.$($m.Value) }
-                'fixed'  { $b[$k] = $m.Value }
-                'switch' { $b[$k] = [switch]$true }   # [switch] so preview shows -Force, not -Force $true
-            }
+            $lk = $ParamLookup[$k]; $p = $byName[$k]
+            $lookupOk[$k] = [bool]($map[$k].Kind -eq 'column' -and $lk -and $lk.Resolve -and $p -and -not $p.ParameterType.IsArray -and
+                                   (Get-Command $lk.Probe -ErrorAction SilentlyContinue))
         }
-        if ($Transform) {
+    }
+    $keyNames = @('Identity','User','Mailbox','Member','Trustee','UserId','Id')
+    $plans = [System.Collections.Generic.List[object]]::new()
+    $rowNo = 0
+    foreach ($row in $rows) {
+        $rowNo++
+        if ($Resolve -and $rows.Count -gt 25 -and ($rowNo % 25) -eq 0) { Write-Host ('  checking row {0} of {1}...' -f $rowNo, $rows.Count) -ForegroundColor White }
+        $b = [ordered]@{}
+        $problems   = [System.Collections.Generic.List[string]]::new()
+        $secretText = [System.Collections.Generic.List[string]]::new()
+        foreach ($k in $map.Keys) {
+            $m = $map[$k]; $p = $byName[$k]
+            $elem = if ($p) { if ($p.ParameterType.IsArray) { $p.ParameterType.GetElementType() } else { $p.ParameterType } } else { $null }
+            if ($m.Kind -eq 'switch') { $b[$k] = [switch]$true; continue }
+            if ($m.Kind -eq 'fixed') {
+                $v = $m.Value
+                if ($v -is [securestring] -and $elem -ne [securestring]) {
+                    $v = [System.Net.NetworkCredential]::new('', $v).Password   # string-typed secret: bind plaintext, masked everywhere
+                    $secretText.Add($v)
+                }
+                $b[$k] = $v; continue
+            }
+            $raw = [string]$row.($m.Value)
+            if ([string]::IsNullOrWhiteSpace($raw)) {
+                if ($requiredNames -contains $k)                  { $problems.Add(("-{0} is blank" -f $k)) }
+                elseif ($blankClears -and $elem -ne [bool])       { $b[$k] = $null }   # $null clears the value
+                continue
+            }
+            $raw = $raw.Trim()
+            if ($m.Secret) {
+                $secretText.Add($raw)
+                # The plaintext is already in the CSV file; convert so a SecureString parameter can bind.
+                $b[$k] = if ($elem -eq [securestring]) { ConvertTo-SecureString -String $raw -AsPlainText -Force } else { $raw }
+                continue
+            }
+            $val = $raw
+            if ($p) {
+                $conv = ConvertTo-ParamValue -Param $p -Text $raw -Allowed $m.Allowed
+                if (-not $conv.Ok) { $problems.Add(("-{0}: {1}" -f $k, $conv.Error)); continue }
+                $val = $conv.Value
+            }
+            if ($lookupOk[$k]) {
+                $match = $null
+                try { $match = & $ParamLookup[$k].Resolve $val } catch { }
+                if (-not $match) { $problems.Add(("-{0}: no mailbox/user found matching '{1}'" -f $k, $val)); continue }
+            }
+            $b[$k] = $val
+        }
+        if ($Transform -and $problems.Count -eq 0) {
             foreach ($tk in $Transform.Keys) {
-                if ($b.Contains($tk)) { $b[$tk] = & $Transform[$tk] $b[$tk] }
+                if (-not $b.Contains($tk)) { continue }
+                try   { $b[$tk] = & $Transform[$tk] $b[$tk] }
+                catch { $problems.Add(("-{0}: {1}" -f $tk, $_.Exception.Message)) }
             }
         }
-        $b
+        $target = (@($keyNames | Where-Object { $b.Contains($_) } | ForEach-Object { '{0}={1}' -f $_, (Format-SafetyValue $b[$_]) }) -join ', ')
+        if (-not $target) { $target = 'row {0}' -f $rowNo }
+        $plans.Add([pscustomobject]@{ Row = $rowNo; Source = $row; Splat = $b; Problems = @($problems); Secrets = @($secretText); Target = $target })
     }
 
-    $preview = Format-CommandPreview -Cmdlet $Cmdlet -BoundParams (& $buildRow $rows[0])
+    $bad  = @($plans | Where-Object { $_.Problems.Count -gt 0 })
+    $todo = @($plans | Where-Object { $_.Problems.Count -eq 0 })
+    if ($bad.Count -gt 0) {
+        Write-Host ''
+        Write-Host ('{0} of {1} rows have problems and will not run:' -f $bad.Count, $plans.Count) -ForegroundColor Yellow
+        foreach ($pl in ($bad | Select-Object -First 20)) { Write-Host ('  row {0}: {1}' -f $pl.Row, ($pl.Problems -join '; ')) -ForegroundColor Yellow }
+        if ($bad.Count -gt 20) { Write-Host ('  ... and {0} more.' -f ($bad.Count - 20)) -ForegroundColor Yellow }
+        if ($todo.Count -eq 0) { Write-Host 'No row can run - fix the CSV and try again.' -ForegroundColor White; return }
+        $c = Get-MenuChoice -Title 'What now?' -Options @('Cancel - fix the CSV first (nothing runs)', ('Run only the {0} good row(s)' -f $todo.Count))
+        if ($c -notlike 'Run only*') { Write-Host 'Cancelled - nothing was run.' -ForegroundColor White; return }
+    }
+
+    # Preview: first and last command, then every target (the first 15, or all on request).
+    $secretNames   = @($map.Keys | Where-Object { $map[$_].Secret })
+    $secretColumns = @($map.Keys | Where-Object { $map[$_].Kind -eq 'column' -and $map[$_].Secret } | ForEach-Object { $map[$_].Value })
     Write-Host ''
-    Write-Host ('Preview - first of {0} rows (dry-run):' -f $rows.Count) -ForegroundColor Yellow
-    Write-CommandColored -Command $preview
+    Write-Host ('Preview - {0} row(s) will run (dry-run):' -f $todo.Count) -ForegroundColor Yellow
+    Write-CommandColored -Command (Format-CommandPreview -Cmdlet $Cmdlet -BoundParams $todo[0].Splat -Secret $secretNames)
+    if ($todo.Count -gt 1) {
+        Write-Host '  ...' -ForegroundColor White
+        Write-CommandColored -Command (Format-CommandPreview -Cmdlet $Cmdlet -BoundParams $todo[-1].Splat -Secret $secretNames)
+    }
+    Write-Host ''
+    Write-Host 'Targets:' -ForegroundColor White
+    $showN = [Math]::Min($todo.Count, 15)
+    foreach ($pl in $todo[0..($showN - 1)]) { Write-Host ('  row {0}: {1}' -f $pl.Row, $pl.Target) -ForegroundColor White }
+    if ($todo.Count -gt $showN) {
+        $more = Read-Host ("  ... and {0} more. Type 'all' to list every row, or Enter to continue" -f ($todo.Count - $showN))
+        if ("$more".Trim().ToLower() -eq 'all') {
+            foreach ($pl in $todo[$showN..($todo.Count - 1)]) { Write-Host ('  row {0}: {1}' -f $pl.Row, $pl.Target) -ForegroundColor White }
+        }
+    }
 
     if ($DryRunOnly) { Write-Host 'DryRunOnly is set - not executing.' -ForegroundColor White; return }
 
-    # Last confirmation before running every row.
+    # Last confirmation before running every row. The cmdlet's own per-row
+    # "Are you sure?" prompt is skipped after it, so a declined prompt can't be
+    # counted as OK and the typed gate below covers every row.
+    $skipVendorConfirm = $cmd.Parameters.ContainsKey('Confirm')
     Write-Host ''
-    Write-Host ('FINAL CONFIRMATION - about to run this for ALL {0} rows, e.g.:' -f $rows.Count) -ForegroundColor Yellow
-    Write-CommandColored -Command $preview
-    if ((Read-Host ("Execute for all {0} rows now? (y/n)" -f $rows.Count)) -notmatch '^(y|yes)$') {
+    Write-Host ('FINAL CONFIRMATION - about to run {0} for {1} row(s).' -f $Cmdlet, $todo.Count) -ForegroundColor Yellow
+    if ($skipVendorConfirm) { Write-Host '  (the cmdlet''s own per-row confirmation is skipped - this one covers every row)' -ForegroundColor White }
+    if (-not (Confirm-Execution -Cmdlet $Cmdlet -RowCount $todo.Count)) {
         Write-Host 'Cancelled - nothing was run.' -ForegroundColor White; return
     }
 
-    $ok=0; $fail=0; $i=0
-    foreach ($row in $rows) {
-        $i++
-        $splat = & $buildRow $row
-        try {
-            & $Cmdlet @splat -ErrorAction Stop | Out-Null
-            $ok++;  Write-Host ("  [{0}/{1}] OK" -f $i, $rows.Count) -ForegroundColor Green
-        } catch {
-            $fail++; Write-Host ("  [{0}/{1}] FAILED: {2}" -f $i, $rows.Count, $_.Exception.Message) -ForegroundColor Red
-        }
+    $isSet = $Cmdlet -like 'Set-*'
+    $newRec = {
+        param($pl, $status, $message, $before)
+        $rec = [ordered]@{ BulkRow = $pl.Row; BulkStatus = $status; BulkMessage = $message; BulkTarget = $pl.Target }
+        if ($isSet) { $rec['BulkBefore'] = $before }
+        foreach ($c in $columns) { if (-not $rec.Contains($c)) { $rec[$c] = if ($secretColumns -contains $c) { '********' } else { $pl.Source.$c } } }
+        [pscustomobject]$rec
     }
+    $results = [System.Collections.Generic.List[object]]::new()
+    $ok = 0; $warn = 0; $fail = 0; $i = 0
+    foreach ($pl in $todo) {
+        $i++
+        $splat = $pl.Splat
+        # For a Set-*, record the values this row replaces (masked if credential-like).
+        $beforeJson = ''
+        if ($isSet) {
+            try {
+                $rp = Get-RevertPlan -Cmdlet $Cmdlet -Bound $splat
+                if ($rp.Supported) {
+                    $bf = [ordered]@{}
+                    foreach ($bk in $rp.Before.Keys) { $bf[$bk] = if ($bk -match $script:SecretNamePattern) { '********' } else { Format-SafetyValue $rp.Before[$bk] } }
+                    $beforeJson = $bf | ConvertTo-Json -Compress
+                }
+            } catch { }
+        }
+        $run = [ordered]@{}
+        foreach ($k in $splat.Keys) { $run[$k] = $splat[$k] }
+        if ($skipVendorConfirm) { $run['Confirm'] = $false }
+        $wv = $null
+        try {
+            & $Cmdlet @run -ErrorAction Stop -WarningVariable wv -WarningAction SilentlyContinue | Out-Null
+            if (@($wv).Count -gt 0) {
+                # A warning usually means nothing changed (e.g. removing an entry that does not exist).
+                $warn++; $status = 'WARNING'
+                $msg = Hide-SecretText -Text ((@($wv) | ForEach-Object { "$_" }) -join ' | ') -Values $pl.Secrets
+                Write-Host ('  [{0}/{1}] WARNING {2}: {3}' -f $i, $todo.Count, $pl.Target, $msg) -ForegroundColor Yellow
+            } else {
+                $ok++; $status = 'OK'; $msg = ''
+                Write-Host ('  [{0}/{1}] OK      {2}' -f $i, $todo.Count, $pl.Target) -ForegroundColor Green
+            }
+        } catch {
+            $fail++; $status = 'FAILED'
+            $msg = Hide-SecretText -Text $_.Exception.Message -Values $pl.Secrets
+            Write-Host ('  [{0}/{1}] FAILED  {2}: {3}' -f $i, $todo.Count, $pl.Target, $msg) -ForegroundColor Red
+        }
+        $results.Add((& $newRec $pl $status $msg $beforeJson))
+    }
+    foreach ($pl in $bad) { $results.Add((& $newRec $pl 'SKIPPED' ($pl.Problems -join '; ') '')) }
+
     Write-Host ''
-    Write-Host ("Bulk done: {0} succeeded, {1} failed, {2} total." -f $ok, $fail, $rows.Count) -ForegroundColor White
+    Write-Host ("Bulk done: {0} OK, {1} with warnings, {2} failed, {3} skipped, {4} row(s) in the file." -f $ok, $warn, $fail, $bad.Count, $rows.Count) -ForegroundColor White
+    # Results file: every row and its outcome (and, for a Set-*, what it replaced),
+    # so a partial or wrong run can be checked and retried. Owner-only, like logs.
+    try {
+        $expDir = Join-Path $script:ToolkitHome 'exports'
+        if (-not (Test-Path -LiteralPath $expDir)) { New-Item -ItemType Directory -Path $expDir -Force | Out-Null }
+        Protect-LocalPath -Path $expDir -Directory
+        $resPath = Join-Path $expDir ('bulk-{0}-{1}-results.csv' -f $Cmdlet, (Get-Date -Format 'yyyyMMdd-HHmmss'))
+        New-Item -ItemType File -Path $resPath -Force | Out-Null
+        Protect-LocalPath -Path $resPath
+        $results | Sort-Object BulkRow | Export-Csv -LiteralPath $resPath -NoTypeInformation -Encoding UTF8
+        Write-Host ('Results saved to {0}' -f $resPath) -ForegroundColor White
+        if ($fail -gt 0 -or $bad.Count -gt 0) { Write-Host '  To retry, keep the FAILED / SKIPPED rows of that file and run it again as a CSV.' -ForegroundColor White }
+    } catch {
+        Write-Host ('Could not save the results file: {0}' -f $_.Exception.Message) -ForegroundColor Yellow
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -1304,6 +1588,7 @@ function Read-OptionMenu {
     Write-Host "   0. Back to previous field   (or type 'cancel' to quit to the menu)" -ForegroundColor White
     $hintNums = if ($Multi) { 'numbers (e.g. 1,3)' } else { 'a number' }
     while ($true) {
+        if (Test-InputEnded) { throw [System.IO.EndOfStreamException]::new('No more input (stdin closed).') }
         $pick = Read-Host ('Enter {0}, 0 to go back, or ? to explain' -f $hintNums)
         $k = ("$pick").Trim().ToLower()
         if ($k -eq '?') {
@@ -1353,12 +1638,7 @@ function Read-ParameterValue {
     # Work out whether this field has a fixed set of allowed values, from (in order):
     # a [ValidateSet], the values of an enum type, or our manual $ParamHints table
     # (needed for Exchange proxy cmdlets that hide their real type as Object[]).
-    $allowed = $null
-    $validate = $Param.Attributes | Where-Object { $_ -is [System.Management.Automation.ValidateSetAttribute] } | Select-Object -First 1
-    if     ($validate)                              { $allowed = [string[]]$validate.ValidValues }
-    elseif ($elem.IsEnum)                           { $allowed = [string[]][enum]::GetNames($elem) }
-    elseif ($Hints -and $Hints.ContainsKey($name))  { $allowed = [string[]]$Hints[$name] }
-    elseif ($ParamHints.ContainsKey($name))         { $allowed = [string[]]$ParamHints[$name] }
+    $allowed = Get-AllowedValues -Param $Param -Hints $Hints
 
     # Say what the field means before asking for it.
     if ($Description) { Write-Host ("  -> {0}" -f $Description) -ForegroundColor White }
@@ -1375,8 +1655,7 @@ function Read-ParameterValue {
     # still be read hidden rather than echoed through the plain array prompt. Reading
     # a single masked value for such a param is acceptable (they are vanishingly rare)
     # and far safer than leaking it to screen/transcript/undo log.
-    $isSecret = ($elem -eq [securestring]) -or
-        ($name -match '(?i)(password|passwd|pwd|secret|credential|token|apikey|api[_-]?key|clientsecret|access[_-]?key)')
+    $isSecret = Test-SecretParam -Param $Param
     if ($isSecret) {
         while ($true) {
             $sec = Read-Host ("Enter -{0} (hidden){1}" -f $name, $(if ($Required) { ' (required)' } else { ' - or press Enter to skip' })) -AsSecureString
@@ -1543,31 +1822,13 @@ function Read-ParameterValue {
                 continue
             }
         }
-        # Boolean fields: the parameter binder rejects a String bound to a [bool]
-        # (e.g. -AutoMapping), so convert the typed answer into a real boolean here
-        # and re-prompt on anything that isn't a yes/no answer. Note 'false' as a
-        # string is truthy in PowerShell, so we must map it explicitly - never cast.
-        if ($elem -eq [bool]) {
-            if     ($key -in @('true','yes','y','1'))  { return $true }
-            elseif ($key -in @('false','no','n','0')) { return $false }
-            else {
-                Write-Host '  Please answer true or false.' -ForegroundColor Yellow
-                continue
-            }
-        }
-        if ($isArray) {
-            $vals = @($val -split '[,\s]+' | Where-Object { $_ })
-            if ($allowed) {
-                # -contains / -eq are case-insensitive for strings, so this catches
-                # typos like 'Send' (vs 'SendAs') and normalises casing to canonical.
-                $bad = @($vals | Where-Object { $allowed -notcontains $_ })
-                if ($bad.Count -gt 0) {
-                    Write-Host ("  Not valid: {0}. Choose from: {1}" -f ($bad -join ', '), ($allowed -join ', ')) -ForegroundColor Yellow
-                    continue
-                }
-                $vals = @($vals | ForEach-Object { $v = $_; $allowed | Where-Object { $_ -eq $v } | Select-Object -First 1 })
-            }
-            return $vals
+        # Boolean and list fields: the binder rejects a String bound to a [bool]
+        # (e.g. -AutoMapping), and a list must not be split inside a name ("Sales
+        # Team"), so both go through the converter shared with the bulk runner.
+        if ($elem -eq [bool] -or $isArray) {
+            $conv = ConvertTo-ParamValue -Param $Param -Text $val -Allowed $allowed
+            if (-not $conv.Ok) { Write-Host ("  {0}." -f $conv.Error) -ForegroundColor Yellow; continue }
+            return $conv.Value
         }
         return $val
     }
@@ -1764,11 +2025,16 @@ function Invoke-Action {
     $mode = Get-MenuChoice -Title "How do you want to run '$($Action.Label)'?" `
                 -Options @('Run once (type the values now)','Bulk - run for every row in a CSV file') -AllowBack
     if (-not $mode) { return 'again' }
-    if ($mode -like 'Bulk*') {
-        Invoke-BulkCmdlet  -Cmdlet $Action.Cmdlet -Prompt $Action.Prompt -ParamHelp $Action.ParamHelp -Preset $Action.Preset -Hints $Action.Hints -Transform $Action.Transform
-    } else {
-        Invoke-GuidedCmdlet -Cmdlet $Action.Cmdlet -Prompt $Action.Prompt -Help $Action.Help -ParamHelp $Action.ParamHelp -Preset $Action.Preset -Hints $Action.Hints -Transform $Action.Transform -Project $Action.Project -Candidates $Action.Candidates
-    }
+    # Same guard as the run-any path: an unexpected error reports and returns to
+    # the menu instead of ending the session (and losing the in-memory undo).
+    try {
+        if ($mode -like 'Bulk*') {
+            Invoke-BulkCmdlet  -Cmdlet $Action.Cmdlet -Prompt $Action.Prompt -ParamHelp $Action.ParamHelp -Preset $Action.Preset -Hints $Action.Hints -Transform $Action.Transform -Resolve
+        } else {
+            Invoke-GuidedCmdlet -Cmdlet $Action.Cmdlet -Prompt $Action.Prompt -Help $Action.Help -ParamHelp $Action.ParamHelp -Preset $Action.Preset -Hints $Action.Hints -Transform $Action.Transform -Project $Action.Project -Candidates $Action.Candidates
+        }
+    } catch [System.IO.EndOfStreamException] { throw }
+    catch { Write-Host ("Could not run '{0}': {1}" -f $Action.Label, $_.Exception.Message) -ForegroundColor Red }
     Get-NextStep
 }
 
@@ -1806,7 +2072,7 @@ function Start-M365Toolkit {
     Start-Transcript -Path $script:LogFile -Append | Out-Null
     try {
         Write-Host '=====================================================' -ForegroundColor White
-        Write-Host '  Microsoft 365 Guided Command Builder  (v0.25)'       -ForegroundColor White
+        Write-Host '  Microsoft 365 Guided Command Builder  (v0.26)'       -ForegroundColor White
         Write-Host '=====================================================' -ForegroundColor White
 
         $cfg = Get-ToolkitConfig
@@ -1944,7 +2210,8 @@ function Start-M365Toolkit {
                         try {
                             if     ($mode -like 'Bulk*') { Invoke-BulkCmdlet  -Cmdlet $cmdName }
                             elseif ($mode)               { Invoke-GuidedCmdlet -Cmdlet $cmdName }
-                        } catch { Write-Host ("Could not run '{0}': {1}" -f $cmdName, $_.Exception.Message) -ForegroundColor Red }
+                        } catch [System.IO.EndOfStreamException] { throw }
+                        catch { Write-Host ("Could not run '{0}': {1}" -f $cmdName, $_.Exception.Message) -ForegroundColor Red }
                         $post = Get-NextStep
                         if ($post -eq 'quit')   { $quit = $true; break }
                         if ($post -eq 'switch') { break }
@@ -1982,4 +2249,6 @@ function Start-M365Toolkit {
     }
 }
 
-Start-M365Toolkit
+# Dot-sourcing (". .\Invoke-M365Toolkit.ps1") loads the functions without starting
+# the menu, so tests can call them. Every normal launch starts the tool.
+if ($MyInvocation.InvocationName -ne '.') { Start-M365Toolkit }

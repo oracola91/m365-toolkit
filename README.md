@@ -23,8 +23,12 @@ the exact command it will run (dry-run), and only runs it when you confirm.
    `ParamHelp` (who → whom), and `Preset` values the action fixes for you. Add an
    action = add one row.
 4. **Bulk runner** (`Invoke-BulkCmdlet`) — run the *same* action once per row of a CSV.
-   You map each parameter to a CSV column or a fixed value, preview the first row, then
-   it runs them all with a per-row success/fail tally.
+   You map each parameter to a CSV column or a fixed value. Every row is checked before
+   anything runs (same value rules as a single run; identity columns are looked up for
+   catalogued actions), blank cells are skipped unless you choose to clear, and the
+   targets are listed. Destructive commands need the command name and the row count
+   typed. Each row's outcome (and, for a `Set-*`, the values it replaced) is saved to
+   `exports\bulk-<cmdlet>-<timestamp>-results.csv`.
 
 ## Requirements / platform support
 
@@ -114,7 +118,8 @@ and the engine guides its parameters exactly the same way. So the tool is not li
 the catalogued actions — it can drive *any* cmdlet the connected module exposes.
 
 **Run once or in bulk:** after choosing an action (or a run-any cmdlet) you pick
-**Run once** (type the values now) or **Bulk from a CSV file** (run it for every row).
+**Run once** (type the values now) or **Bulk from a CSV file** (run it for every row;
+UTF-8 or Excel's ANSI encoding, `,` or `;` separated).
 
 **Results / export:** when a command returns objects (e.g. a lookup), the tool offers to
 show them as a table, show only columns you choose, or **export to CSV** (all columns or a
