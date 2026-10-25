@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: PSScriptAnalyzer (errors fail the build)
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -RequiredVersion 1.24.0 -Repository PSGallery -Scope CurrentUser -Force
+          # Write-Host is the point of an interactive console tool, so that rule is left out.
+          $r = Invoke-ScriptAnalyzer -Path ./Invoke-M365Toolkit.ps1 -ExcludeRule PSAvoidUsingWriteHost
+          $r | Sort-Object Severity, Line | Format-Table -AutoSize Severity, Line, RuleName, Message | Out-String -Width 220 | Write-Host
+          if (@($r | Where-Object Severity -eq 'Error').Count -gt 0) { throw 'PSScriptAnalyzer found errors.' }
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  shell: pwsh }
+          - { os: windows-latest, shell: pwsh }
+          - { os: windows-latest, shell: powershell }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Pester (${{ matrix.shell }} on ${{ matrix.os }})
+        shell: ${{ matrix.shell }}
+        run: |
+          Install-Module Pester -RequiredVersion 5.7.1 -Repository PSGallery -Scope CurrentUser -Force -SkipPublisherCheck
+          Import-Module Pester -RequiredVersion 5.7.1
+          $r = Invoke-Pester ./tests -Output Detailed -PassThru
+          if ($r.FailedCount -gt 0 -or $r.Result -ne 'Passed') { exit 1 }
