@@ -8,7 +8,8 @@
     action in plain language. The tool introspects the real cmdlet, walks you
     through its parameters (Required -> Optional -> Switches) in human terms,
     shows a dry-run preview of the assembled command, and only runs it when you
-    confirm. Everything is transcript-logged for an audit trail.
+    confirm. Every action is recorded in a local action log (the Microsoft 365
+    audit log is the full record of changes); a full transcript only on request.
 
     Architecture (three independent layers, each extended by adding one row):
       1. $Services  - connection registry: one row per M365 service.
@@ -16,7 +17,7 @@
       3. $Actions   - plain-language catalogue: friendly label -> cmdlet.
 
 .NOTES
-    v0.28 - 2026-10-25. Engine runs on PowerShell 7+ (Windows/macOS/Linux) and
+    v0.29 - 2026-10-25. Engine runs on PowerShell 7+ (Windows/macOS/Linux) and
     Windows PowerShell 5.1. Per service: Exchange, Purview, Entra, Intune and Teams
     work everywhere; SharePoint (PnP) needs pwsh 7.2+; SharePoint Admin (SPO) and
     Power Platform use Windows-only modules and run on Windows only.
@@ -30,13 +31,17 @@ param(
     # Sign in to Graph (Entra, Intune) with a device code instead of the browser.
     # Use it only if the browser sign-in hangs (seen on macOS): many tenants block
     # device code flow because it is a common phishing route.
-    [switch]$UseDeviceCode
+    [switch]$UseDeviceCode,
+    # Also write a full screen transcript to logs\. Off by default: it holds every
+    # directory search and result you view. The action log is always written.
+    [switch]$Transcript
 )
 
 # Run with 'Stop', but remember the caller's setting: under 'irm | iex' this scope
 # is the caller's own shell, which gets its setting back when the tool exits.
 $script:CallerErrorActionPreference = $ErrorActionPreference
 $ErrorActionPreference = 'Stop'
+$script:ToolkitVersion = 'v0.29'
 
 # Where logs and CSV exports go. Prefer the script's own folder, but when the
 # tool is run remotely (irm <URL> | iex) there is no script file on disk, so
@@ -62,6 +67,7 @@ $Services = @(
         # (Show-Result / Save-ResultCsv), so the display format data is not needed.
         ConnectArgs = { param($Upn) @{ UserPrincipalName = $Upn; ShowBanner = $false; LoadCmdletHelp = $true; SkipLoadingFormatData = $true } }
         Disconnect  = 'Disconnect-ExchangeOnline'
+        MinModuleVersion = '3.7.0'   # LoadCmdletHelp exists from 3.7
     }
     [pscustomobject]@{
         Name        = 'Entra / Identity (Graph)'
@@ -72,6 +78,7 @@ $Services = @(
         # not in the user's token cache, so it ends with the session.
         Scopes         = @('User.Read.All','GroupMember.Read.All')
         CommandModules = @('Microsoft.Graph.Users','Microsoft.Graph.Groups','Microsoft.Graph.Identity.DirectoryManagement')
+        InstallModules = @('Microsoft.Graph.Authentication','Microsoft.Graph.Users','Microsoft.Graph.Groups','Microsoft.Graph.Identity.DirectoryManagement')
         ConnectArgs = { param($Upn, $Svc) $a = @{ Scopes = $Svc.Scopes; ContextScope = 'Process' }; if ($UseDeviceCode) { $a.UseDeviceCode = $true }; $a }
         Disconnect  = 'Disconnect-MgGraph'
     }
@@ -79,7 +86,13 @@ $Services = @(
         Name        = 'SharePoint Online (PnP)'
         Module      = 'PnP.PowerShell'
         ConnectCmd  = 'Connect-PnPOnline'
-        ConnectArgs = { param($Upn) @{ Url = (Read-Host 'SharePoint site/admin URL'); Interactive = $true } }
+        # Current PnP.PowerShell has no shared app any more: interactive sign-in needs
+        # the client ID of an app registered in your tenant.
+        ConnectArgs = { param($Upn)
+            $a = @{ Url = (Read-Host 'SharePoint site/admin URL'); Interactive = $true }
+            $cid = "$(Read-Host "Client ID of your tenant's PnP app registration (Enter to try without)")".Trim()
+            if ($cid) { $a.ClientId = $cid }
+            $a }
         Disconnect  = 'Disconnect-PnPOnline'
         MinPSVersion = '7.4'   # PnP.PowerShell 3.x needs PowerShell 7.4 or later
     }
@@ -116,6 +129,7 @@ $Services = @(
         # action is ever added, widen the matching scope to .ReadWrite.All then.
         Scopes         = @('DeviceManagementManagedDevices.Read.All')
         CommandModules = @('Microsoft.Graph.DeviceManagement')
+        InstallModules = @('Microsoft.Graph.Authentication','Microsoft.Graph.DeviceManagement')
         ConnectArgs = { param($Upn, $Svc) $a = @{ Scopes = $Svc.Scopes; ContextScope = 'Process' }; if ($UseDeviceCode) { $a.UseDeviceCode = $true }; $a }
         Disconnect  = 'Disconnect-MgGraph'
     }
@@ -141,11 +155,40 @@ function Get-UserSharedMailboxAccess {
     # No reverse index exists ("which mailboxes can X open?"), so scan the shared
     # mailboxes and keep those where the user has a direct (non-inherited)
     # FullAccess grant. Can take a minute on tenants with many shared mailboxes.
-    Get-Mailbox -ResultSize Unlimited -RecipientTypeDetails SharedMailbox -ErrorAction Stop |
-        Where-Object {
-            @(Get-MailboxPermission -Identity $_.Identity -User $User -ErrorAction SilentlyContinue |
-                Where-Object { $_.AccessRights -contains 'FullAccess' -and -not $_.IsInherited }).Count -gt 0
-        }
+    # A mailbox that can't be read (throttling, a transient error) is counted and
+    # reported, never silently dropped - a quiet gap would read as "no access".
+    $shared = @(Get-Mailbox -ResultSize Unlimited -RecipientTypeDetails SharedMailbox -ErrorAction Stop)
+    $failed = 0
+    foreach ($m in $shared) {
+        try {
+            $hit = @(Get-MailboxPermission -Identity $m.Identity -User $User -ErrorAction Stop |
+                     Where-Object { $_.AccessRights -contains 'FullAccess' -and -not $_.IsInherited })
+            if ($hit.Count -gt 0) { $m }
+        } catch { $failed++ }
+    }
+    if ($failed -gt 0) { Write-Warning ('{0} of {1} shared mailboxes could not be read - this list may be incomplete.' -f $failed, $shared.Count) }
+}
+
+# The calendar folder of a mailbox as "<mailbox>:\<folder>". The folder name is
+# localized (e.g. "Kalender"), so read it from the mailbox; fall back to
+# "Calendar" when it can't be read.
+function Get-CalendarFolderId {
+    param([Parameter(Mandatory)] [string] $Mailbox)
+    $mbx = $Mailbox.Trim()
+    try {
+        $f = Get-MailboxFolderStatistics -Identity $mbx -FolderScope Calendar -ErrorAction Stop |
+             Where-Object { $_.FolderType -eq 'Calendar' } | Select-Object -First 1
+        if ($f -and $f.FolderPath) { return ('{0}:{1}' -f $mbx, ($f.FolderPath -replace '/', '\')) }
+    } catch { }
+    return ('{0}:\Calendar' -f $mbx)
+}
+
+# Strip control characters (ESC sequences can rewrite the terminal) from text
+# that comes from the tenant before it is shown.
+function ConvertTo-SafeText {
+    param([AllowNull()] $Text)
+    if ($null -eq $Text) { return '' }
+    return ([string]$Text -replace '[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '')
 }
 
 # Turn a Get-MailboxFolderPermission entry's .User object back into a value that
@@ -180,12 +223,12 @@ function Get-FolderPermissionUserAddress {
 $calendarUserCandidates = { param($bound)
     $mbx = "$($bound['Identity'])".Trim()
     if ([string]::IsNullOrWhiteSpace($mbx)) { return @() }
-    Get-MailboxFolderPermission -Identity ('{0}:\Calendar' -f $mbx) -ErrorAction Stop |
+    Get-MailboxFolderPermission -Identity (Get-CalendarFolderId -Mailbox $mbx) -ErrorAction Stop |
         Where-Object { $_.User.DisplayName -notin @('Default','Anonymous') } |
         ForEach-Object {
             $addr = Get-FolderPermissionUserAddress -User $_.User
             [pscustomobject]@{
-                Display = ('{0}  <{1}>  [{2}]' -f $_.User.DisplayName, $(if ($addr) { $addr } else { '?' }), (@($_.AccessRights) -join ', '))
+                Display = ('{0}  <{1}>  [{2}]' -f (ConvertTo-SafeText $_.User.DisplayName), $(if ($addr) { $addr } else { '?' }), (@($_.AccessRights) -join ', '))
                 Value   = $addr
             }
         } | Where-Object { $_.Value }
@@ -318,7 +361,7 @@ $Actions = @(
         Id='cal-check-access'; Service='Exchange Online'; Category='Check access'
         Label='See who has access to a calendar'
         Cmdlet='Get-MailboxFolderPermission'; Prompt=@('Identity')
-        Transform=@{ Identity = { param($v) '{0}:\Calendar' -f $v } }
+        Transform=@{ Identity = { param($v) Get-CalendarFolderId -Mailbox $v } }
         Help='List who can see or edit a mailbox''s calendar, and the role each has.'
         ParamHelp=@{ Identity='The mailbox whose calendar you want to check (email or name) - the tool targets its \Calendar folder automatically' }
     }
@@ -326,7 +369,7 @@ $Actions = @(
         Id='cal-give-access'; Service='Exchange Online'; Category='Give access'
         Label='Give a user access to a calendar'
         Cmdlet='Add-MailboxFolderPermission'; Prompt=@('Identity','User','AccessRights')
-        Transform=@{ Identity = { param($v) '{0}:\Calendar' -f $v } }
+        Transform=@{ Identity = { param($v) Get-CalendarFolderId -Mailbox $v } }
         Hints=@{ AccessRights=@('Owner','PublishingEditor','Editor','PublishingAuthor','Author','NonEditingAuthor','Reviewer','Contributor','AvailabilityOnly','LimitedDetails','None') }
         Help='Grant a person a role on a mailbox''s calendar. Use this only if they have NO existing entry - otherwise use "Change a user''s calendar access".'
         ParamHelp=@{
@@ -339,7 +382,7 @@ $Actions = @(
         Id='cal-change-access'; Service='Exchange Online'; Category='Remove & change access'
         Label='Change a user''s calendar access'
         Cmdlet='Set-MailboxFolderPermission'; Prompt=@('Identity','User','AccessRights')
-        Transform=@{ Identity = { param($v) '{0}:\Calendar' -f $v } }
+        Transform=@{ Identity = { param($v) Get-CalendarFolderId -Mailbox $v } }
         Candidates=@{ User = $calendarUserCandidates }
         Hints=@{ AccessRights=@('Owner','PublishingEditor','Editor','PublishingAuthor','Author','NonEditingAuthor','Reviewer','Contributor','AvailabilityOnly','LimitedDetails','None') }
         Help='Change the role of someone who ALREADY has access to a calendar (fails if they have no existing entry - use "Give a user access" first). After you pick the calendar, the tool lists only the people who already have an entry, so you can''t hit the "no existing entry" error.'
@@ -353,7 +396,7 @@ $Actions = @(
         Id='cal-remove-access'; Service='Exchange Online'; Category='Remove & change access'
         Label='Remove a user''s calendar access'
         Cmdlet='Remove-MailboxFolderPermission'; Prompt=@('Identity','User')
-        Transform=@{ Identity = { param($v) '{0}:\Calendar' -f $v } }
+        Transform=@{ Identity = { param($v) Get-CalendarFolderId -Mailbox $v } }
         Candidates=@{ User = $calendarUserCandidates }
         Help='Take away a person''s access to a mailbox''s calendar. After you pick the calendar, the tool lists only the people who currently have an entry, so you pick from real grants instead of guessing.'
         ParamHelp=@{
@@ -523,7 +566,7 @@ $recipientLookup = @{
                         Where-Object { $_.DisplayName -like "*$term*" -or "$($_.PrimarySmtpAddress)" -like "*$term*" } |
                         Select-Object -First 25)
         }
-        $rows | ForEach-Object { [pscustomobject]@{ Display = ('{0}  <{1}>  [{2}]' -f $_.DisplayName, $_.PrimarySmtpAddress, $_.RecipientTypeDetails); Value = [string]$_.PrimarySmtpAddress } }
+        $rows | ForEach-Object { [pscustomobject]@{ Display = ('{0}  <{1}>  [{2}]' -f (ConvertTo-SafeText $_.DisplayName), $_.PrimarySmtpAddress, $_.RecipientTypeDetails); Value = [string]$_.PrimarySmtpAddress } }
     }
     # Resolve an EXACT typed value to a real recipient (or $null if it doesn't exist).
     Resolve = { param($v) Get-EXORecipient -Identity $v -ErrorAction SilentlyContinue | Select-Object -First 1 }
@@ -541,7 +584,7 @@ $ParamLookup = @{
             param($term)
             $t = "$term".Replace("'","''")   # escape quotes so O'Brien-type names can't break/inject the OData filter
             Get-MgUser -Filter "startswith(displayName,'$t') or startswith(mail,'$t') or startswith(userPrincipalName,'$t')" -Top 25 -ErrorAction Stop |
-                ForEach-Object { [pscustomobject]@{ Display = ('{0}  <{1}>' -f $_.DisplayName, $_.UserPrincipalName); Value = [string]$_.UserPrincipalName } }
+                ForEach-Object { [pscustomobject]@{ Display = ('{0}  <{1}>' -f (ConvertTo-SafeText $_.DisplayName), $_.UserPrincipalName); Value = [string]$_.UserPrincipalName } }
         }
         Resolve = { param($v) Get-MgUser -UserId $v -ErrorAction SilentlyContinue }
     }
@@ -663,35 +706,149 @@ function Connect-M365Service {
     if ($Service.MinPSVersion -and $PSVersionTable.PSVersion -lt [version]$Service.MinPSVersion) {
         throw "'$($Service.Name)' needs PowerShell $($Service.MinPSVersion) or later (this is $($PSVersionTable.PSVersion))."
     }
-    if (-not (Get-Module -ListAvailable -Name $Service.Module)) {
-        Write-Host ("Module '{0}' is not installed." -f $Service.Module) -ForegroundColor Yellow
-        if ((Read-Host 'Install it now for the current user? (y/n)') -match '^(y|yes)$') {
-            Install-Module $Service.Module -Scope CurrentUser -Force
-        } else {
-            throw "Cannot connect without module '$($Service.Module)'."
+    # Modules this service needs. Graph services list the few sub-modules they use
+    # instead of the whole Microsoft.Graph meta-module (dozens of packages).
+    $mods = if ($Service.InstallModules) { @($Service.InstallModules) } else { @($Service.Module) }
+    foreach ($m in $mods) {
+        if (Get-Module -ListAvailable -Name $m) { continue }
+        Write-Host ("Module '{0}' is not installed." -f $m) -ForegroundColor Yellow
+        # Say exactly what would be installed, from where and by whom, before asking.
+        $found = $null
+        try { $found = Find-Module -Name $m -Repository PSGallery -ErrorAction Stop } catch { }
+        if ($found) { Write-Host ("  The PowerShell Gallery has {0} {1} by {2}." -f $found.Name, $found.Version, $found.Author) -ForegroundColor White }
+        if ((Read-Host 'Install it now for the current user? (y/n)') -notmatch '^(y|yes)$') { throw "Cannot connect without module '$m'." }
+        # From the PowerShell Gallery only, and without -Force, so PowerShellGet's
+        # own untrusted-repository prompt (which names the source) still appears.
+        Install-Module -Name $m -Repository PSGallery -Scope CurrentUser -ErrorAction Stop
+    }
+    # Import. Only one known harmless error is ignored: a stale Exchange Online temp
+    # format file ('exchange.format.ps1xml') left by an earlier session in the same
+    # shell (the toolkit formats its own output). Any other failure is shown.
+    foreach ($m in $mods) {
+        try { Import-Module $m -ErrorAction Stop -WarningAction SilentlyContinue }
+        catch {
+            if ("$($_.Exception.Message)" -notmatch 'format\.ps1xml') { throw ("Could not load module '{0}': {1}" -f $m, $_.Exception.Message) }
         }
     }
-    # Import quietly. On macOS / pwsh 7 a stale ExchangeOnlineManagement temp
-    # format file (left by an earlier EXO session in the SAME shell) can make a
-    # later Import-Module of ANY module surface a 'exchange.format.ps1xml not
-    # found' error - and with $ErrorActionPreference='Stop' that halts the
-    # connect. It is harmless here (the toolkit formats its own output), so
-    # swallow all import noise and never let it stop us.
-    try { Import-Module $Service.Module -ErrorAction SilentlyContinue -WarningAction SilentlyContinue 2>$null } catch { }
+    $loaded = Get-Module -Name $mods[0] | Sort-Object Version -Descending | Select-Object -First 1
+    if ($loaded) {
+        Write-Host ("Using {0} {1}" -f $loaded.Name, $loaded.Version) -ForegroundColor White
+        if ($Service.MinModuleVersion -and $loaded.Version -lt [version]$Service.MinModuleVersion) {
+            throw ("'{0}' needs {1} {2} or later (loaded: {3}). Update it with: Update-Module {1}" -f $Service.Name, $loaded.Name, $Service.MinModuleVersion, $loaded.Version)
+        }
+    }
     $connectArgs = & $Service.ConnectArgs $Upn $Service
     Write-Host ("Connecting to {0} as {1} ..." -f $Service.Name, $Upn) -ForegroundColor White
-    # Pause the transcript across the sign-in so a device code / interactive secret
-    # is never written to the on-disk log, then resume (append) to the same file.
+    # With -Transcript, pause it across the sign-in so a device code or interactive
+    # secret is never written to the log, then resume the same file. Say so if
+    # either step fails instead of carrying on silently.
     $transcriptPaused = $false
-    try { Stop-Transcript | Out-Null; $transcriptPaused = $true } catch { }
+    if ($script:TranscriptOn) {
+        try { Stop-Transcript | Out-Null; $transcriptPaused = $true }
+        catch { Write-Host ('  [!] Could not pause the transcript ({0}) - the sign-in may be written to it.' -f $_.Exception.Message) -ForegroundColor Yellow }
+    }
     try {
         $script:LastConnectResult = & $Service.ConnectCmd @connectArgs
     } finally {
-        if ($transcriptPaused -and $script:LogFile) {
-            try { Start-Transcript -Path $script:LogFile -Append | Out-Null } catch { }
+        if ($transcriptPaused) {
+            try { Start-Transcript -Path $script:LogFile -Append | Out-Null }
+            catch {
+                $script:TranscriptOn = $false
+                Write-Host ('[!] Could not resume the transcript ({0}) - the rest of this session is NOT in it.' -f $_.Exception.Message) -ForegroundColor Red
+            }
         }
     }
     Write-Host ("Connected to {0}." -f $Service.Name) -ForegroundColor Green
+}
+
+# ---------------------------------------------------------------------------
+# Action log: one JSON line per thing the tool DOES (start, sign-in, sign-out,
+# each command run, each bulk row, each undo): who, which service and tenant,
+# the command, its target and the outcome. Other parameter values are not kept -
+# the Microsoft 365 audit log is the full record of changes. The full screen
+# transcript is only written with -Transcript.
+# ---------------------------------------------------------------------------
+function Write-ActionLog {
+    param([Parameter(Mandatory)] [string] $Kind, [string] $Cmdlet, [string] $Target, [string[]] $Params, [string] $Outcome, [string] $Message)
+    if (-not $script:ActionLog) { return }
+    $entry = [ordered]@{
+        time = (Get-Date).ToString('o'); event = $Kind; service = $script:CurrentService
+        account = $script:CurrentAccount; tenant = $script:CurrentTenant
+        cmdlet = $Cmdlet; target = $Target; params = @($Params | Where-Object { $_ }); outcome = $Outcome; message = $Message
+    }
+    try {
+        [System.IO.File]::AppendAllText($script:ActionLog, ($entry | ConvertTo-Json -Compress -Depth 4) + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
+    } catch {
+        if (-not $script:ActionLogWarned) {
+            $script:ActionLogWarned = $true
+            Write-Host ('[!] Could not write the action log ({0}).' -f $_.Exception.Message) -ForegroundColor Yellow
+        }
+    }
+}
+
+# The target of a command, from its key parameters, for screens and the action log.
+function Get-TargetText {
+    param([System.Collections.IDictionary] $Bound)
+    if (-not $Bound) { return '' }
+    (@('Identity','User','Mailbox','Member','Trustee','UserId','Id') | Where-Object { $Bound.Contains($_) } |
+        ForEach-Object { '{0}={1}' -f $_, (Format-SafetyValue $Bound[$_]) }) -join ', '
+}
+
+# Retention: delete logs and the tool's own exports older than 30 days, and drop
+# undo lines older than that. Runs at start and on exit; reports what it could
+# not delete rather than failing quietly.
+function Invoke-RetentionPurge {
+    param([int] $Days = 30, [switch] $Quiet)
+    $cutoff = (Get-Date).AddDays(-$Days)
+    $removed = 0; $failed = 0
+    foreach ($sub in 'logs','exports') {
+        $dir = Join-Path $script:ToolkitHome $sub
+        if (-not (Test-Path -LiteralPath $dir)) { continue }
+        foreach ($f in @(Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt $cutoff -and $_.Name -ne 'undo-hints.log' })) {
+            try { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop; $removed++ } catch { $failed++ }
+        }
+    }
+    $undo = Join-Path (Join-Path $script:ToolkitHome 'logs') 'undo-hints.log'
+    if (Test-Path -LiteralPath $undo) {
+        try {
+            $enc   = [System.Text.UTF8Encoding]::new($false)
+            $lines = @([System.IO.File]::ReadAllLines($undo, $enc))
+            $keep  = @($lines | Where-Object {
+                $d = [datetime]::MinValue
+                -not ($_ -match '^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)') -or
+                -not [datetime]::TryParseExact($Matches[1], 'yyyy-MM-dd HH:mm:ss', [cultureinfo]::InvariantCulture, 'None', [ref]$d) -or
+                $d -ge $cutoff })
+            if ($keep.Count -ne $lines.Count) { [System.IO.File]::WriteAllLines($undo, [string[]]$keep, $enc); $removed += ($lines.Count - $keep.Count) }
+        } catch { $failed++ }
+    }
+    if (-not $Quiet -and $removed -gt 0) { Write-Host ('Retention: removed {0} log/export file(s) or undo line(s) older than {1} days.' -f $removed, $Days) -ForegroundColor White }
+    if ($failed -gt 0) { Write-Host ('[!] Retention: {0} old file(s) could not be deleted.' -f $failed) -ForegroundColor Yellow }
+}
+
+# Logs and exports live in the tool's folder. Warn when that folder looks synced
+# (OneDrive, iCloud, Dropbox...) or is a network share: the files hold directory data.
+function Test-DataFolder {
+    $p = [string]$script:ToolkitHome
+    if ($p -match '(?i)(OneDrive|iCloud|Mobile Documents|Dropbox|Google Drive|Box Sync)' -or $p.StartsWith('\\')) {
+        Write-Host ("[!] The tool's folder ({0}) looks synced or shared. Its logs and exports hold directory data - run the tool from a local folder." -f $p) -ForegroundColor Yellow
+    }
+}
+
+# Make exported cells safe to open in Excel: a value starting with = + - @ (or a
+# tab / CR) is a formula there, so it gets a leading ' and is shown as text.
+# Lists are written as "a; b" instead of "System.Object[]".
+function ConvertTo-SafeCsvRow {
+    param($Items)
+    foreach ($it in @($Items)) {
+        $o = [ordered]@{}
+        foreach ($p in $it.PSObject.Properties) {
+            $v = $p.Value
+            if ($v -is [System.Collections.IEnumerable] -and $v -isnot [string]) { $v = (@($v) | ForEach-Object { "$_" }) -join '; ' }
+            if ($v -is [string]) { $v = ConvertTo-SafeText $v; if ($v -match '^[=+\-@\t\r]') { $v = "'" + $v } }
+            $o[$p.Name] = $v
+        }
+        [pscustomobject]$o
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -751,8 +908,14 @@ function Disconnect-M365Service {
     if (-not $cmd) { return }
     $a = @{}
     if ($cmd.Parameters.ContainsKey('Confirm')) { $a.Confirm = $false }
-    try   { & $dc @a -ErrorAction Stop *> $null; Write-Host ('Signed out of {0}.' -f $Service.Name) -ForegroundColor White }
-    catch { Write-Host ('Could not sign out of {0}: {1}' -f $Service.Name, $_.Exception.Message) -ForegroundColor Yellow }
+    try {
+        & $dc @a -ErrorAction Stop *> $null
+        Write-Host ('Signed out of {0}.' -f $Service.Name) -ForegroundColor White
+        Write-ActionLog -Kind 'sign-out' -Message $Service.Name -Outcome 'OK'
+    } catch {
+        Write-Host ('Could not sign out of {0}: {1}' -f $Service.Name, $_.Exception.Message) -ForegroundColor Yellow
+        Write-ActionLog -Kind 'sign-out' -Message ('{0}: {1}' -f $Service.Name, $_.Exception.Message) -Outcome 'FAILED'
+    }
 }
 
 # Why a command needs a typed confirmation, or $null for a plain y. Read verbs
@@ -1143,14 +1306,18 @@ function Hide-SecretResult {
     param($Items)
     foreach ($it in @($Items)) {
         if ($null -eq $it) { continue }
-        if ($it -is [string]) { $it -replace $script:JwtPattern, '********'; continue }
+        if ($it -is [string]) { (ConvertTo-SafeText $it) -replace $script:JwtPattern, '********'; continue }
         $names = @($it.PSObject.Properties.Name)
         $hit = @($names | Where-Object { $_ -match $script:SecretNamePattern })
         $jwt = @($names | Where-Object { $hit -notcontains $_ -and $it.$_ -is [string] -and $it.$_ -match $script:JwtPattern })
-        if ($hit.Count -eq 0 -and $jwt.Count -eq 0) { $it; continue }
+        $ctl = @($names | Where-Object { $it.$_ -is [string] -and $it.$_ -match '[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]' })
+        if ($hit.Count -eq 0 -and $jwt.Count -eq 0 -and $ctl.Count -eq 0) { $it; continue }
         $o = [ordered]@{}
         foreach ($n in $names) {
-            $o[$n] = if ($hit -contains $n) { '********' } elseif ($jwt -contains $n) { $it.$n -replace $script:JwtPattern, '********' } else { $it.$n }
+            $o[$n] = if ($hit -contains $n) { '********' }
+                     elseif ($jwt -contains $n) { (ConvertTo-SafeText $it.$n) -replace $script:JwtPattern, '********' }
+                     elseif ($ctl -contains $n) { ConvertTo-SafeText $it.$n }
+                     else { $it.$n }
         }
         [pscustomobject]$o
     }
@@ -1377,6 +1544,8 @@ function Invoke-GuidedCmdlet {
         # A warning often means nothing changed (e.g. removing an entry that does not exist).
         if (@($wv).Count -gt 0) { Write-Host 'Done, with warning(s) above - check whether the change was actually made.' -ForegroundColor Yellow }
         else                    { Write-Host 'Done.' -ForegroundColor Green }
+        Write-ActionLog -Kind 'run' -Cmdlet $Cmdlet -Target (Get-TargetText -Bound $bound) -Params @($bound.Keys) `
+            -Outcome $(if (@($wv).Count -gt 0) { 'WARNING' } else { 'OK' }) -Message ((@($wv) | ForEach-Object { "$_" }) -join ' | ')
         # Change safety net: print + log the exact command to undo this change.
         if ($revertPlan.Supported) {
             $rb = [ordered]@{}
@@ -1392,22 +1561,23 @@ function Invoke-GuidedCmdlet {
             Write-Host 'To undo this change, run:' -ForegroundColor Yellow
             Write-CommandColored -Command $revCmd
             if ($revertPlan.Missing.Count -gt 0) { Write-Host ('  (partial: does not restore {0})' -f ($revertPlan.Missing -join ', ')) -ForegroundColor Yellow }
+            # Keep the line in logs\undo-hints.log: owner-only, newest 500, and lines older
+            # than 30 days are dropped by the retention purge. One encoding (UTF-8, no
+            # BOM) for reading and writing, so non-ASCII names survive on 5.1 too.
+            $undoFile = Join-Path (Join-Path $script:ToolkitHome 'logs') 'undo-hints.log'
             try {
-                $undoDir = Join-Path $script:ToolkitHome 'logs'
-                if (-not (Test-Path $undoDir)) { New-Item -ItemType Directory -Path $undoDir | Out-Null }
-                $undoFile = Join-Path $undoDir 'undo-hints.log'
-                Add-Content -Path $undoFile -Value ('{0}  {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $revCmd)
-                # This single file is appended to on every reverted change, so the
-                # 30-day LastWriteTime purge never ages it out. Cap it to the most
-                # recent entries and lock it to the current user (it holds plaintext
-                # identities + before/after values).
-                try {
-                    $lines = @(Get-Content -Path $undoFile -ErrorAction SilentlyContinue)
-                    if ($lines.Count -gt 500) { Set-Content -Path $undoFile -Value ($lines[-500..-1]) -Encoding UTF8 }
-                } catch { }
-                Protect-LocalPath -Path $undoFile
+                $undoDir = Split-Path -Parent $undoFile
+                if (-not (Test-Path -LiteralPath $undoDir)) { New-Item -ItemType Directory -Path $undoDir | Out-Null }
+                $enc = [System.Text.UTF8Encoding]::new($false)
+                if (-not (Test-Path -LiteralPath $undoFile)) { New-Item -ItemType File -Path $undoFile | Out-Null }
+                [void](Protect-LocalPath -Path $undoFile)   # locked down before anything is written
+                $lines = @([System.IO.File]::ReadAllLines($undoFile, $enc)) + @(('{0}  {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $revCmd))
+                if ($lines.Count -gt 500) { $lines = $lines[-500..-1] }
+                [System.IO.File]::WriteAllLines($undoFile, [string[]]$lines, $enc)
                 Write-Host ('  (also saved to {0})' -f $undoFile) -ForegroundColor White
-            } catch {}
+            } catch {
+                Write-Host ('  [!] Could not save the undo line to {0}: {1}' -f $undoFile, $_.Exception.Message) -ForegroundColor Yellow
+            }
             # Stash the built revert (already a bindable splat) so the user can run
             # it ON DEMAND from the "What next?" menu - no prompt after every change,
             # and no retyping/pasting the command (the tool has no paste-a-command
@@ -1429,9 +1599,16 @@ function Invoke-GuidedCmdlet {
             try   { $result = & $Project $result }
             catch { Write-Host ('  (could not reshape result: {0})' -f $_.Exception.Message) -ForegroundColor Yellow }
         }
-        Show-Result -Result $result -Cmdlet $Cmdlet
-    } catch {
-        Write-Host ('Failed: {0}' -f $_.Exception.Message) -ForegroundColor Red
+        # The command already ran: a problem showing or saving its result must not
+        # read as "Failed" (and invite a retry of a change that was made).
+        try { Show-Result -Result $result -Cmdlet $Cmdlet }
+        catch [System.IO.EndOfStreamException] { throw }
+        catch { Write-Host ('The command ran, but showing or saving its result failed: {0}' -f $_.Exception.Message) -ForegroundColor Yellow }
+    } catch [System.IO.EndOfStreamException] { throw }
+    catch {
+        $msg = Hide-SecretText -Text $_.Exception.Message -Values @($secretKeys | ForEach-Object { $bound[$_] } | Where-Object { $_ -is [string] })
+        Write-Host ('Failed: {0}' -f $msg) -ForegroundColor Red
+        Write-ActionLog -Kind 'run' -Cmdlet $Cmdlet -Target (Get-TargetText -Bound $bound) -Params @($bound.Keys) -Outcome 'FAILED' -Message $msg
     }
 }
 
@@ -1743,6 +1920,7 @@ function Invoke-BulkCmdlet {
             $msg = Hide-SecretText -Text $_.Exception.Message -Values $pl.Secrets
             Write-Host ('  [{0}/{1}] FAILED  {2}: {3}' -f $i, $todo.Count, $pl.Target, $msg) -ForegroundColor Red
         }
+        Write-ActionLog -Kind 'bulk-row' -Cmdlet $Cmdlet -Target $pl.Target -Params @($splat.Keys) -Outcome $status -Message $msg
         $results.Add((& $newRec $pl $status $msg $beforeJson))
     }
     foreach ($pl in $bad) { $results.Add((& $newRec $pl 'SKIPPED' ($pl.Problems -join '; ') '')) }
@@ -1754,12 +1932,13 @@ function Invoke-BulkCmdlet {
     try {
         $expDir = Join-Path $script:ToolkitHome 'exports'
         if (-not (Test-Path -LiteralPath $expDir)) { New-Item -ItemType Directory -Path $expDir -Force | Out-Null }
-        Protect-LocalPath -Path $expDir -Directory
+        [void](Protect-LocalPath -Path $expDir -Directory)
         $resPath = Join-Path $expDir ('bulk-{0}-{1}-results.csv' -f $Cmdlet, (Get-Date -Format 'yyyyMMdd-HHmmss'))
         New-Item -ItemType File -Path $resPath -Force | Out-Null
-        Protect-LocalPath -Path $resPath
-        $results | Sort-Object BulkRow | Export-Csv -LiteralPath $resPath -NoTypeInformation -Encoding UTF8
+        [void](Protect-LocalPath -Path $resPath)
+        ConvertTo-SafeCsvRow -Items @($results | Sort-Object BulkRow) | Export-Csv -LiteralPath $resPath -NoTypeInformation -Encoding UTF8
         Write-Host ('Results saved to {0}' -f $resPath) -ForegroundColor White
+        Write-ActionLog -Kind 'bulk' -Cmdlet $Cmdlet -Outcome 'DONE' -Message ('{0} OK, {1} warnings, {2} failed, {3} skipped; results {4}' -f $ok, $warn, $fail, $bad.Count, $resPath)
         if ($fail -gt 0 -or $bad.Count -gt 0) { Write-Host '  To retry, keep the FAILED / SKIPPED rows of that file and run it again as a CSV.' -ForegroundColor White }
     } catch {
         Write-Host ('Could not save the results file: {0}' -f $_.Exception.Message) -ForegroundColor Yellow
@@ -1995,7 +2174,9 @@ function Read-ParameterValue {
         if ($key -eq 'last' -and $hasLast) {
             $rows = @($script:LastResult)
             $cols = @($rows[0].PSObject.Properties.Name)
-            $idCols = @('PrimarySmtpAddress','UserPrincipalName','Mail','Email','Identity','Id','WindowsEmailAddress')
+            # Prefer the column named like the field being filled: a -User field takes
+            # the User column of a permission result, not the mailbox's Identity.
+            $idCols = @($name) + @('PrimarySmtpAddress','UserPrincipalName','Mail','Email','Identity','Id','WindowsEmailAddress')
             $col = $idCols | Where-Object { $cols -contains $_ } | Select-Object -First 1
             if (-not $col) {
                 $col = Get-MenuChoice -Title '  Which value from the last result?' -Options $cols -AllowBack
@@ -2068,13 +2249,24 @@ function Select-ResultColumns {
 # ---------------------------------------------------------------------------
 function Save-ResultCsv {
     param([Parameter(Mandatory)] $Items, [string] $Cmdlet)
-    $default = Join-Path (Join-Path $script:ToolkitHome 'exports') ("{0}-{1}.csv" -f $Cmdlet, (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    $expDir  = Join-Path $script:ToolkitHome 'exports'
+    $default = Join-Path $expDir ("{0}-{1}.csv" -f $Cmdlet, (Get-Date -Format 'yyyyMMdd-HHmmss'))
     $path = Read-Host ("CSV path (Enter for {0})" -f $default)
     if ([string]::IsNullOrWhiteSpace($path)) { $path = $default } else { $path = $path.Trim('"',' ') }
-    $dir = Split-Path -Parent $path
-    if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-    $Items | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
-    Write-Host ("Saved {0} row(s) to {1}" -f @($Items).Count, $path) -ForegroundColor Green
+    try {
+        $full   = [System.IO.Path]::GetFullPath($path)
+        $dir    = Split-Path -Parent $full
+        $inside = $dir -eq [System.IO.Path]::GetFullPath($expDir)
+        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        if ($inside) { [void](Protect-LocalPath -Path $dir -Directory) }
+        New-Item -ItemType File -Path $full -Force | Out-Null   # create and lock down before writing directory data
+        [void](Protect-LocalPath -Path $full)
+        ConvertTo-SafeCsvRow -Items $Items | Export-Csv -LiteralPath $full -NoTypeInformation -Encoding UTF8
+        Write-Host ("Saved {0} row(s) to {1}" -f @($Items).Count, $full) -ForegroundColor Green
+        if (-not $inside) { Write-Host '  This file is outside the exports folder, so the 30-day clean-up will not delete it. It holds directory data - delete it when you are done.' -ForegroundColor Yellow }
+    } catch {
+        Write-Host ('Could not save the CSV: {0}' -f $_.Exception.Message) -ForegroundColor Red
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -2086,6 +2278,7 @@ function Show-Result {
     param($Result, [string] $Cmdlet)
 
     $items = @(Hide-SecretResult -Items $Result)
+    $script:LastResult = @()   # a new result replaces the old one for 'last', even when it is empty
     if ($items.Count -eq 0) { Write-Host 'No objects returned.' -ForegroundColor White; return }
     Write-Host ("Returned {0} item(s)." -f $items.Count) -ForegroundColor White
 
@@ -2127,10 +2320,10 @@ function Show-Result {
 # Tiny persisted config (UPN + last service) at <ToolkitHome>\config.json so
 # you don't retype your email every launch.
 # ---------------------------------------------------------------------------
-# Restrict a file or directory to the current user only. Best-effort and
-# cross-platform: an NTFS ACL (no inheritance, owner FullControl) on Windows,
-# chmod 600 (file) / 700 (dir) elsewhere. Never throws - a perms hiccup must not
-# stop the tool. Used for logs/, config.json, and undo-hints.log.
+# Restrict a file or directory to the current user only, cross-platform: an NTFS
+# ACL (no inheritance, owner FullControl) on Windows, chmod 600 (file) / 700
+# (dir) elsewhere. Never throws - a perms hiccup must not stop the tool - but
+# says so and returns $false, because these files hold directory data.
 function Protect-LocalPath {
     param([Parameter(Mandatory)] [string] $Path, [switch] $Directory)
     $onWindows = $IsWindows -or ($env:OS -eq 'Windows_NT')   # $IsWindows is $null on Windows PowerShell 5.1
@@ -2145,8 +2338,13 @@ function Protect-LocalPath {
             Set-Acl -Path $Path -AclObject $acl
         } else {
             & chmod ($(if ($Directory) { '700' } else { '600' })) $Path 2>$null
+            if ($LASTEXITCODE -ne 0) { throw "chmod exited with code $LASTEXITCODE" }
         }
-    } catch { }
+        return $true
+    } catch {
+        Write-Host ("[!] Could not restrict {0} to your account ({1}). Other users of this computer may be able to read it." -f $Path, $_.Exception.Message) -ForegroundColor Yellow
+        return $false
+    }
 }
 function Get-ToolkitConfig {
     $path = Join-Path $script:ToolkitHome 'config.json'
@@ -2160,10 +2358,10 @@ function Save-ToolkitConfig {
     # Create the file empty and lock it down BEFORE writing content, so there is no
     # window where config.json exists with default (possibly group/world-readable)
     # perms. It only holds a UPN + last-used service, but this closes the TOCTOU gap.
-    if (-not (Test-Path $cfgPath)) { New-Item -ItemType File -Path $cfgPath -Force | Out-Null; Protect-LocalPath -Path $cfgPath }
+    if (-not (Test-Path $cfgPath)) { New-Item -ItemType File -Path $cfgPath -Force | Out-Null; [void](Protect-LocalPath -Path $cfgPath) }
     [pscustomobject]@{ Upn = $Upn; LastService = $LastService } |
         ConvertTo-Json | Set-Content -Path $cfgPath -Encoding UTF8
-    Protect-LocalPath -Path $cfgPath   # re-assert (also covers the already-existed case)
+    [void](Protect-LocalPath -Path $cfgPath)   # re-assert (also covers the already-existed case)
 }
 
 # ---------------------------------------------------------------------------
@@ -2177,8 +2375,10 @@ function Show-WhoAmI {
     $who = Get-SignedInAccount -Service $Service
     if (-not $who -or -not $who.Account) {
         Write-Host ("You typed {0}. {1} gives no way to read the signed-in account back - check the sign-in window used the right one." -f $Upn, $Service.Name) -ForegroundColor Yellow
+        $script:CurrentAccount = '{0} (typed; not read back)' -f $Upn; $script:CurrentTenant = $null
         return $true
     }
+    $script:CurrentAccount = $who.Account; $script:CurrentTenant = $who.Tenant
     Write-Host ("Signed in as: {0}" -f $who.Account) -ForegroundColor Green
     if ($who.Tenant) { Write-Host ("  Tenant: {0}" -f $who.Tenant) -ForegroundColor White }
     if ($who.Scopes) {
@@ -2225,9 +2425,11 @@ function Get-NextStep {
                     $rvSplat = $rv.Splat
                     & $rv.Cmdlet @rvSplat -ErrorAction Stop | Out-Null
                     Write-Host 'Reverted.' -ForegroundColor Green
+                    Write-ActionLog -Kind 'undo' -Cmdlet $rv.Cmdlet -Target $rv.Target -Params @($rvSplat.Keys) -Outcome 'OK'
                     $script:LastRevert = $null   # consumed - don't offer the same undo again
                 } catch {
                     Write-Host ('Revert failed: {0}' -f $_.Exception.Message) -ForegroundColor Red
+                    Write-ActionLog -Kind 'undo' -Cmdlet $rv.Cmdlet -Target $rv.Target -Outcome 'FAILED' -Message $_.Exception.Message
                 }
             }
             continue   # re-show the menu after handling the undo
@@ -2278,24 +2480,36 @@ function Start-M365Toolkit {
     $script:CurrentService = $null
 
 
+    $script:CurrentAccount = $null
+    $script:CurrentTenant  = $null
     $logDir = Join-Path $script:ToolkitHome 'logs'
-    if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out-Null }
-    # Logs can contain PII (names/emails) and connection detail, so restrict the
-    # folder to the current user and purge anything older than 30 days. Best-effort:
-    # never let a permissions/purge hiccup stop the tool from starting.
-    Protect-LocalPath -Path $logDir -Directory
-    try {
-        Get-ChildItem -Path $logDir -File -ErrorAction SilentlyContinue |
-            Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-30) } |
-            Remove-Item -Force -ErrorAction SilentlyContinue
-    } catch { }
-    $stamp  = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $script:LogFile = Join-Path $logDir "session-$stamp.log"   # script-scoped so the connect step can pause/resume it
-    Start-Transcript -Path $script:LogFile -Append | Out-Null
+    if (-not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path $logDir | Out-Null }
+    # Logs and exports hold names, addresses and directory data: owner-only, and
+    # nothing older than 30 days is kept (checked now and again on exit).
+    [void](Protect-LocalPath -Path $logDir -Directory)
+    Invoke-RetentionPurge
+    Test-DataFolder
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $script:ActionLog = Join-Path $logDir "actions-$stamp.jsonl"
+    New-Item -ItemType File -Path $script:ActionLog -Force | Out-Null
+    [void](Protect-LocalPath -Path $script:ActionLog)
+    # The full screen transcript only on request (-Transcript): it holds every
+    # search hit and result viewed. Script-scoped so the connect step can pause it.
+    $script:TranscriptOn = $false
+    $script:LogFile = $null
+    if ($Transcript) {
+        $script:LogFile = Join-Path $logDir "session-$stamp.log"
+        $ta = @{ Path = $script:LogFile; Append = $true }
+        if ((Get-Command Start-Transcript).Parameters.ContainsKey('UseMinimalHeader')) { $ta.UseMinimalHeader = $true }
+        try { Start-Transcript @ta | Out-Null; $script:TranscriptOn = $true }
+        catch { Write-Host ('[!] Could not start the transcript: {0}' -f $_.Exception.Message) -ForegroundColor Yellow }
+    }
     try {
         Write-Host '=====================================================' -ForegroundColor White
-        Write-Host '  Microsoft 365 Guided Command Builder  (v0.28)'       -ForegroundColor White
+        Write-Host ('  Microsoft 365 Guided Command Builder  ({0})' -f $script:ToolkitVersion) -ForegroundColor White
         Write-Host '=====================================================' -ForegroundColor White
+        Write-Host ('Action log: {0}{1}' -f $script:ActionLog, $(if ($script:TranscriptOn) { "  |  transcript: $($script:LogFile)" } else { '' })) -ForegroundColor White
+        Write-ActionLog -Kind 'start' -Message ('{0}{1}{2}' -f $script:ToolkitVersion, $(if ($DryRunOnly) { ' DryRunOnly' } else { '' }), $(if ($script:TranscriptOn) { ' Transcript' } else { '' }))
 
         $cfg = Get-ToolkitConfig
         $upnPrompt = if ($cfg.Upn) { "Your email (UPN) [Enter = $($cfg.Upn)]" } else { 'Your email (UPN)' }
@@ -2314,6 +2528,7 @@ function Start-M365Toolkit {
             if ($svcName -eq 'Quit') { break }
 
             $service = $Services | Where-Object { $_.Name -eq $svcName }
+            $script:CurrentService = $svcName
             if (-not $connected[$svcName]) {
                 # A failed sign-in (bad creds, cancelled login, no network) throws
                 # under $ErrorActionPreference='Stop'. Without this catch it unwinds
@@ -2326,12 +2541,16 @@ function Start-M365Toolkit {
                     foreach ($other in @($Services | Where-Object { $_.ConnectCmd -eq $service.ConnectCmd -and $_.Name -ne $svcName })) { $connected.Remove($other.Name) }
                     $connected[$svcName] = $true
                     if (-not (Show-WhoAmI -Service $service -Upn $upn)) {
+                        Write-ActionLog -Kind 'sign-in' -Outcome 'DECLINED' -Message 'signed-in account differs from the typed email'
                         Disconnect-M365Service -Service $service
                         $connected.Remove($svcName)
                         Write-Host 'Back to the service menu.' -ForegroundColor White
                         continue
                     }
-                } catch {
+                    Write-ActionLog -Kind 'sign-in' -Outcome 'OK'
+                } catch [System.IO.EndOfStreamException] { throw }
+                catch {
+                    Write-ActionLog -Kind 'sign-in' -Outcome 'FAILED' -Message $_.Exception.Message
                     Write-Host ("Could not connect to {0}: {1}" -f $svcName, $_.Exception.Message) -ForegroundColor Red
                     Write-Host 'Back to the service menu - try again, or pick another service / Quit.' -ForegroundColor White
                     continue
@@ -2485,7 +2704,9 @@ function Start-M365Toolkit {
                 Disconnect-M365Service -Service $svc
             }
         }
-        try { Stop-Transcript | Out-Null } catch { }
+        Write-ActionLog -Kind 'stop'
+        if ($script:TranscriptOn) { try { Stop-Transcript | Out-Null } catch { } }
+        Invoke-RetentionPurge -Quiet
         Set-Variable -Name ErrorActionPreference -Scope Script -Value $script:CallerErrorActionPreference
     }
 }
