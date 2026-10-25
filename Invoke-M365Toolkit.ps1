@@ -17,7 +17,7 @@
       3. $Actions   - plain-language catalogue: friendly label -> cmdlet.
 
 .NOTES
-    v0.31 - 2026-10-25. Engine runs on PowerShell 7+ (Windows/macOS/Linux) and
+    v0.32 - 2026-10-25. Engine runs on PowerShell 7+ (Windows/macOS/Linux) and
     Windows PowerShell 5.1. Per service: Exchange, Purview, Entra, Intune and Teams
     work everywhere; SharePoint (PnP) needs pwsh 7.2+; SharePoint Admin (SPO) and
     Power Platform use Windows-only modules and run on Windows only.
@@ -41,7 +41,7 @@ param(
 # is the caller's own shell, which gets its setting back when the tool exits.
 $script:CallerErrorActionPreference = $ErrorActionPreference
 $ErrorActionPreference = 'Stop'
-$script:ToolkitVersion = 'v0.31'
+$script:ToolkitVersion = 'v0.32'
 
 # Where logs and CSV exports go. Prefer the script's own folder, but when the
 # tool is run remotely (irm <URL> | iex) there is no script file on disk, so
@@ -1019,6 +1019,15 @@ function Disconnect-M365Service {
     }
 }
 
+# Commands whose name contains the typed text. The text is matched literally, so
+# characters such as [ or * can't break the search (an invalid wildcard used to
+# end the tool) or widen it.
+function Find-CommandByText {
+    param([object[]] $Commands, [string] $Text)
+    $pat = '*' + [System.Management.Automation.WildcardPattern]::Escape($Text) + '*'
+    @($Commands | Where-Object { "$($_.Name)" -like $pat })
+}
+
 # Why a command needs a typed confirmation, or $null for a plain y. Read verbs
 # never do. Destructive verbs, Invoke- actions (wipe, retire...) and raw non-GET
 # requests, changes to admin roles or mail flow, purge/force switches and mail
@@ -1630,6 +1639,8 @@ function Invoke-GuidedCmdlet {
     Write-Host ''
     Write-Host 'FINAL CONFIRMATION - about to execute this command:' -ForegroundColor Yellow
     Write-CommandColored -Command $preview
+    $skipVendorConfirm = $cmd.Parameters.ContainsKey('Confirm')
+    if ($skipVendorConfirm) { Write-Host '  (the cmdlet''s own confirmation is skipped - your answer here counts)' -ForegroundColor White }
     # Destructive verbs need the command name typed; everything else an explicit y.
     # Same gate as the bulk runner (Confirm-Execution).
     if (-not (Confirm-Execution -Cmdlet $Cmdlet -Bound $bound)) {
@@ -1641,7 +1652,10 @@ function Invoke-GuidedCmdlet {
     $script:LastRevert = $null   # a new change makes any earlier undo stale
     try {
         $wv = $null
-        $result = & $Cmdlet @bound -ErrorAction Stop -WarningVariable wv
+        $runArgs = [ordered]@{}
+        foreach ($k in $bound.Keys) { $runArgs[$k] = $bound[$k] }
+        if ($skipVendorConfirm) { $runArgs['Confirm'] = $false }
+        $result = & $Cmdlet @runArgs -ErrorAction Stop -WarningVariable wv
         # A warning often means nothing changed (e.g. removing an entry that does not exist).
         if (@($wv).Count -gt 0) { Write-Host 'Done, with warning(s) above - check whether the change was actually made.' -ForegroundColor Yellow }
         else                    { Write-Host 'Done.' -ForegroundColor Green }
@@ -2740,7 +2754,7 @@ function Start-M365Toolkit {
                                 # advanced hatch stays scoped to M365 and can't run arbitrary
                                 # local cmdlets (Remove-Item, Invoke-Expression, ...).
                                 if ($svcCmds.Name -contains $entry) { $cmdName = $entry; break }
-                                $hits = @($svcCmds | Where-Object { $_.Name -like "*$entry*" } | Select-Object -ExpandProperty Name | Sort-Object)
+                                $hits = @(Find-CommandByText -Commands $svcCmds -Text $entry | Select-Object -ExpandProperty Name | Sort-Object)
                                 if ($hits.Count -eq 0)  { Write-Host ("Nothing matches '{0}'." -f $entry) -ForegroundColor Yellow; continue }
                                 if ($hits.Count -gt 40) { Write-Host ("'{0}' matches {1} commands - narrow it down." -f $entry, $hits.Count) -ForegroundColor Yellow; continue }
                                 $p = Get-MenuChoice -Title ("Commands matching '{0}':" -f $entry) -Options $hits -AllowBack
@@ -2753,7 +2767,8 @@ function Start-M365Toolkit {
                         if ($inVerb.Count -gt 40) {
                             $kw = (Read-Host ("  {0}- has {1} commands - type part of the name to filter, or Enter to list all" -f $verb, $inVerb.Count)).Trim()
                             if ($kw) {
-                                $inVerb = @($inVerb | Where-Object { $_ -like "*$kw*" })
+                                $kwPat = '*' + [System.Management.Automation.WildcardPattern]::Escape($kw) + '*'
+                                $inVerb = @($inVerb | Where-Object { $_ -like $kwPat })
                                 if ($inVerb.Count -eq 0) { Write-Host '  Nothing matched - pick another verb.' -ForegroundColor Yellow; continue }
                             }
                         }
