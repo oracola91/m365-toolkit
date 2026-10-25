@@ -132,6 +132,7 @@ Append one entry to `$Actions` in `Invoke-M365Toolkit.ps1`:
 
 ```powershell
 [pscustomobject]@{
+    Id        = 'mbx-hide-from-gal'  # required: unique and stable; actions are dispatched by Id, so never change it once shipped
     Service   = 'Exchange Online'
     Category  = 'Mailboxes'
     Label     = 'Hide a mailbox from the address list'
