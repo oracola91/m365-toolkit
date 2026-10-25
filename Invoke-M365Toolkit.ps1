@@ -16,7 +16,7 @@
       3. $Actions   - plain-language catalogue: friendly label -> cmdlet.
 
 .NOTES
-    v0.26 - 2026-10-25. Engine runs on PowerShell 7+ (Windows/macOS/Linux) and
+    v0.27 - 2026-10-25. Engine runs on PowerShell 7+ (Windows/macOS/Linux) and
     Windows PowerShell 5.1. Per service: Exchange, Purview, Entra, Intune and Teams
     work everywhere; SharePoint (PnP) needs pwsh 7.2+; SharePoint Admin (SPO) and
     Power Platform use Windows-only modules and run on Windows only.
@@ -474,7 +474,9 @@ $ParamHints = @{
 
 # Parameter names that look like credentials. One pattern for every place that
 # decides what to read hidden and what to mask (prompts, previews, undo, bulk).
-$script:SecretNamePattern = '(?i)(password|passwd|pwd|secret|credential|token|apikey|api[_-]?key|clientsecret|access[_-]?key)'
+$script:SecretNamePattern = '(?i)(password|passwd|pwd|secret|credential|token|apikey|api[_-]?key|clientsecret|access[_-]?key|privatekey|accountkey|encryptionkey|sharedkey|signingkey|storagekey|subscriptionkey|passphrase|connectionstring|certificatebase64)'
+# Bearer tokens (JWTs) in command output are masked before display or export.
+$script:JwtPattern = 'eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*'
 
 # ---------------------------------------------------------------------------
 # Optional target lookups. For identity-style parameters the user can type
@@ -677,6 +679,33 @@ function Connect-M365Service {
 }
 
 # ---------------------------------------------------------------------------
+# Render one value as a PowerShell literal, so the preview, the final
+# confirmation and the logged undo line are exactly what runs if pasted. A
+# value can come from the tenant (an undo line carries the CURRENT values of a
+# mailbox, which its owner may control), so strings are single-quoted with every
+# quote character doubled - PowerShell also treats the typographic quotes
+# U+2018 to U+201B as single quotes - and line breaks become spaces.
+# ---------------------------------------------------------------------------
+function ConvertTo-PSLiteral {
+    param($Value)
+    if ($null -eq $Value)          { return '$null' }
+    if ($Value -is [securestring]) { return "'********'" }
+    if ($Value -is [bool])         { return '$' + $Value.ToString().ToLower() }
+    if ($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal]) {
+        return $Value.ToString([cultureinfo]::InvariantCulture)
+    }
+    if ($Value -is [datetime])     { $Value = $Value.ToString('o') }
+    if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string] -and $Value -isnot [System.Collections.IDictionary]) {
+        $parts = @($Value | ForEach-Object { ConvertTo-PSLiteral $_ })
+        if ($parts.Count -eq 0) { return '@()' }
+        return ($parts -join ',')
+    }
+    $s = ([string]$Value) -replace '[\r\n]+', ' '
+    $s = $s -replace "['\u2018\u2019\u201A\u201B]", '$0$0'
+    return "'" + $s + "'"
+}
+
+# ---------------------------------------------------------------------------
 # Render an assembled splat as a copy-pasteable command line (for the preview).
 # ---------------------------------------------------------------------------
 function Format-CommandPreview {
@@ -692,14 +721,8 @@ function Format-CommandPreview {
             [void]$sb.Append(" -$key '********'")   # secret: masked so it never reaches the screen/transcript
         } elseif ($val -is [switch]) {
             if ($val.IsPresent) { [void]$sb.Append(" -$key") }
-        } elseif ($val -is [bool]) {
-            [void]$sb.Append(" -$key `$$($val.ToString().ToLower())")
-        } elseif ($val -is [array]) {
-            [void]$sb.Append(" -$key " + (($val | ForEach-Object { "'$_'" }) -join ','))
-        } elseif ("$val" -match '\s') {
-            [void]$sb.Append(" -$key '$val'")
         } else {
-            [void]$sb.Append(" -$key $val")
+            [void]$sb.Append(" -$key " + (ConvertTo-PSLiteral $val))
         }
     }
     $sb.ToString()
@@ -750,7 +773,7 @@ function Get-RevertPlan {
         [Parameter(Mandatory)] [string]    $Cmdlet,
         [Parameter(Mandatory)] [hashtable] $Bound
     )
-    $plan = [pscustomobject]@{ Supported = $false; Keys = @{}; Before = @{} }
+    $plan = [pscustomobject]@{ Supported = $false; Keys = @{}; Before = @{}; Missing = @() }
     if ($Cmdlet -notlike 'Set-*') { return $plan }
     $getCmd = 'Get-' + $Cmdlet.Substring(4)
     $getCommand = Get-Command -Name $getCmd -ErrorAction SilentlyContinue
@@ -764,31 +787,36 @@ function Get-RevertPlan {
     # every one the Get- cmdlet accepts, so we read the single matching record.
     $keyNames = @(@('Identity','Id','User','Mailbox') | Where-Object { $Bound.Contains($_) })
     if ($keyNames.Count -eq 0) { return $plan }
-    $getParams = @{}
     $getParamNames = @($getCommand.Parameters.Keys)   # null-safe: empty array if Parameters is null
-    foreach ($k in $keyNames) {
-        if ($getParamNames -contains $k) { $getParams[$k] = $Bound[$k] }
-    }
-    $cur = $null
+    # A key the Get- cmdlet can't take means it can't be told WHICH record to read,
+    # so a "before" it returns could belong to another record. Decline the undo.
+    if (@($keyNames | Where-Object { $getParamNames -notcontains $_ }).Count -gt 0) { return $plan }
+    $getParams = @{}
+    foreach ($k in $keyNames) { $getParams[$k] = $Bound[$k] }
+    $found = @()
     try {
-        $cur = & $getCmd @getParams -WarningAction SilentlyContinue -ErrorAction Stop | Select-Object -First 1
+        $found = @(& $getCmd @getParams -WarningAction SilentlyContinue -ErrorAction Stop | Select-Object -First 2)
     } catch {
         # Positional fallback only for a SINGLE key - for a compound key a lone
         # positional value would match the wrong record (e.g. Default), so we
         # decline the undo entirely rather than generate a corrupting one.
         if ($keyNames.Count -eq 1) {
-            try { $cur = & $getCmd $Bound[$keyNames[0]] -WarningAction SilentlyContinue -ErrorAction Stop | Select-Object -First 1 } catch { return $plan }
+            try { $found = @(& $getCmd $Bound[$keyNames[0]] -WarningAction SilentlyContinue -ErrorAction Stop | Select-Object -First 2) } catch { return $plan }
         } else { return $plan }
     }
-    if (-not $cur) { return $plan }
+    # Exactly one record, or no undo: with two matches we can't tell which one changes.
+    if ($found.Count -ne 1) { return $plan }
+    $cur    = $found[0]
     $props  = @($cur.PSObject.Properties.Name)
     $before = @{}
+    $missing = @()
     foreach ($k in @($Bound.Keys)) {
         if ($keyNames -contains $k)   { continue }   # keys locate the record; they are replayed verbatim, never reverted
         if ($Bound[$k] -is [switch])  { continue }   # switches aren't a simple before/after value
-        if ($props -contains $k)      { $before[$k] = $cur.$k }
+        if ($props -contains $k)      { $before[$k] = $cur.$k } else { $missing += $k }
     }
     if ($before.Count -eq 0) { return $plan }
+    $plan.Missing = $missing   # changed values the undo will NOT restore (shown to the user)
     # Replay the exact key values the user typed (clean, bindable) - not $cur's
     # key properties, which are display objects that may not re-bind.
     $keys = @{}
@@ -906,7 +934,21 @@ function Test-SecretParam {
     param([Parameter(Mandatory)] $Param)
     $type = $Param.ParameterType
     $elem = if ($type.IsArray) { $type.GetElementType() } else { $type }
-    return (($elem -eq [securestring]) -or ($Param.Name -match $script:SecretNamePattern))
+    if ($elem -eq [securestring] -or $elem -eq [pscredential]) { return $true }
+    # A credential-like NAME only counts for text-like types, so a Boolean such
+    # as -ResetPasswordOnNextLogon is still asked as true / false.
+    return (($Param.Name -match $script:SecretNamePattern) -and ($elem -eq [string] -or $elem -eq [object]))
+}
+
+# A credential-like parameter of a structured type (e.g. a password profile
+# object): the builder can't enter one safely, so it is skipped, never echoed.
+function Test-StructuredSecretParam {
+    param([Parameter(Mandatory)] $Param)
+    $type = $Param.ParameterType
+    $elem = if ($type.IsArray) { $type.GetElementType() } else { $type }
+    if (-not ($Param.Name -match $script:SecretNamePattern) -or (Test-SecretParam -Param $Param)) { return $false }
+    $simple = $elem.IsPrimitive -or $elem.IsEnum -or $elem -eq [decimal] -or $elem -eq [datetime] -or $elem -eq [switch]
+    return (-not $simple)
 }
 
 # Turn text typed at a prompt, or read from a CSV cell, into a value the
@@ -988,6 +1030,25 @@ function Import-BulkCsv {
 
 # Replace each given secret value inside a message with ********, so a binder or
 # service error that echoes its input cannot leak a secret to screen or log.
+# Mask secrets in command OUTPUT before it is shown, piped with 'last' or saved:
+# bearer tokens in text, and properties whose name looks like a credential.
+function Hide-SecretResult {
+    param($Items)
+    foreach ($it in @($Items)) {
+        if ($null -eq $it) { continue }
+        if ($it -is [string]) { $it -replace $script:JwtPattern, '********'; continue }
+        $names = @($it.PSObject.Properties.Name)
+        $hit = @($names | Where-Object { $_ -match $script:SecretNamePattern })
+        $jwt = @($names | Where-Object { $hit -notcontains $_ -and $it.$_ -is [string] -and $it.$_ -match $script:JwtPattern })
+        if ($hit.Count -eq 0 -and $jwt.Count -eq 0) { $it; continue }
+        $o = [ordered]@{}
+        foreach ($n in $names) {
+            $o[$n] = if ($hit -contains $n) { '********' } elseif ($jwt -contains $n) { $it.$n -replace $script:JwtPattern, '********' } else { $it.$n }
+        }
+        [pscustomobject]$o
+    }
+}
+
 function Hide-SecretText {
     param([string] $Text, [string[]] $Values)
     $out = "$Text"
@@ -1168,7 +1229,13 @@ function Invoke-GuidedCmdlet {
         Write-Host ''
         Write-Host 'Current value(s) that will change:' -ForegroundColor Yellow
         foreach ($k in $revertPlan.Before.Keys) {
-            Write-Host ('  {0}:  {1}  ->  {2}' -f $k, (Format-SafetyValue $revertPlan.Before[$k]), (Format-SafetyValue $bound[$k])) -ForegroundColor White
+            $mask = ($secretKeys -contains $k) -or ($k -match $script:SecretNamePattern)
+            $old  = if ($mask) { '********' } else { Format-SafetyValue $revertPlan.Before[$k] }
+            $new  = if ($mask) { '********' } else { Format-SafetyValue $bound[$k] }
+            Write-Host ('  {0}:  {1}  ->  {2}' -f $k, $old, $new) -ForegroundColor White
+        }
+        if ($revertPlan.Missing.Count -gt 0) {
+            Write-Host ('  Not covered by the undo (no current value to read back): {0}' -f ($revertPlan.Missing -join ', ')) -ForegroundColor Yellow
         }
     }
 
@@ -1195,9 +1262,13 @@ function Invoke-GuidedCmdlet {
     }
 
     Write-Host 'Running...' -ForegroundColor White
+    $script:LastRevert = $null   # a new change makes any earlier undo stale
     try {
-        $result = & $Cmdlet @bound -ErrorAction Stop
-        Write-Host 'Done.' -ForegroundColor Green
+        $wv = $null
+        $result = & $Cmdlet @bound -ErrorAction Stop -WarningVariable wv
+        # A warning often means nothing changed (e.g. removing an entry that does not exist).
+        if (@($wv).Count -gt 0) { Write-Host 'Done, with warning(s) above - check whether the change was actually made.' -ForegroundColor Yellow }
+        else                    { Write-Host 'Done.' -ForegroundColor Green }
         # Change safety net: print + log the exact command to undo this change.
         if ($revertPlan.Supported) {
             $rb = [ordered]@{}
@@ -1212,6 +1283,7 @@ function Invoke-GuidedCmdlet {
             Write-Host ''
             Write-Host 'To undo this change, run:' -ForegroundColor Yellow
             Write-CommandColored -Command $revCmd
+            if ($revertPlan.Missing.Count -gt 0) { Write-Host ('  (partial: does not restore {0})' -f ($revertPlan.Missing -join ', ')) -ForegroundColor Yellow }
             try {
                 $undoDir = Join-Path $script:ToolkitHome 'logs'
                 if (-not (Test-Path $undoDir)) { New-Item -ItemType Directory -Path $undoDir | Out-Null }
@@ -1232,7 +1304,15 @@ function Invoke-GuidedCmdlet {
             # it ON DEMAND from the "What next?" menu - no prompt after every change,
             # and no retyping/pasting the command (the tool has no paste-a-command
             # entry by design). Each successful Set replaces the previous stash.
-            $script:LastRevert = @{ Cmdlet = $Cmdlet; Splat = $rb; Preview = $revCmd }
+            $script:LastRevert = @{
+                Cmdlet  = $Cmdlet; Splat = $rb; Preview = $revCmd
+                Target  = (@($revertPlan.Keys.Keys | ForEach-Object { '{0}={1}' -f $_, (Format-SafetyValue $revertPlan.Keys[$_]) }) -join ', ')
+                Time    = Get-Date
+                Service = $script:CurrentService
+                Partial = ($revertPlan.Missing.Count -gt 0)
+            }
+        } elseif ($Cmdlet -like 'Set-*') {
+            Write-Host '  No automatic undo for this change (its current values could not be read back safely).' -ForegroundColor Yellow
         }
         # Optional per-action projection: reshape a raw/cluttered result into clean,
         # readable columns (e.g. flatten Get-MgUserMemberOf into Name/Email/Type)
@@ -1302,6 +1382,12 @@ function Invoke-BulkCmdlet {
         if ($map.Contains($p.Name)) { return }
         $desc = if ($ParamHelp) { $ParamHelp[$p.Name] } else { $null }
         if ($desc) { Write-Host ("  -> {0}" -f $desc) -ForegroundColor White }
+        # A credential needs a user name AND a password; one CSV column can't carry it.
+        $pType = if ($p.ParameterType.IsArray) { $p.ParameterType.GetElementType() } else { $p.ParameterType }
+        if ($pType -eq [pscredential] -or (Test-StructuredSecretParam -Param $p)) {
+            if ($required) { throw ("Bulk mode can't fill -{0} (a credential or structured secret). Run this command once instead." -f $p.Name) }
+            Write-Host ("  -{0} can't be filled in bulk mode - skipped." -f $p.Name) -ForegroundColor Yellow; return
+        }
         # Same allowed-value and secret rules as the guided prompt.
         $allowed  = Get-AllowedValues -Param $p -Hints $Hints
         $isSecret = Test-SecretParam -Param $p
@@ -1501,6 +1587,7 @@ function Invoke-BulkCmdlet {
         Write-Host 'Cancelled - nothing was run.' -ForegroundColor White; return
     }
 
+    $script:LastRevert = $null   # a new change makes any earlier undo stale
     $isSet = $Cmdlet -like 'Set-*'
     $newRec = {
         param($pl, $status, $message, $before)
@@ -1655,8 +1742,22 @@ function Read-ParameterValue {
     # still be read hidden rather than echoed through the plain array prompt. Reading
     # a single masked value for such a param is acceptable (they are vanishingly rare)
     # and far safer than leaking it to screen/transcript/undo log.
+    if (Test-StructuredSecretParam -Param $Param) {
+        Write-Host ("  -{0} takes a structured {1} object that this builder can't enter safely - skipped." -f $name, $elem.Name) -ForegroundColor Yellow
+        if ($Required) { Write-Host '  It is required, so this command can''t be built here.' -ForegroundColor Yellow; $script:ParamCancel = $true }
+        return $null
+    }
     $isSecret = Test-SecretParam -Param $Param
     if ($isSecret) {
+        $credUser = $null
+        if ($elem -eq [pscredential]) {
+            # A credential is a user name plus a password: ask the name in clear, the password hidden.
+            $credUser = "$(Read-Host ("User name for -{0}{1}" -f $name, $(if ($Required) { ' (required)' } else { ' - or press Enter to skip' })))".Trim()
+            if (-not $credUser) {
+                if ($Required) { $script:ParamCancel = $true; Write-Host '  A user name is required here - cancelled.' -ForegroundColor Yellow }
+                return $null
+            }
+        }
         while ($true) {
             $sec = Read-Host ("Enter -{0} (hidden){1}" -f $name, $(if ($Required) { ' (required)' } else { ' - or press Enter to skip' })) -AsSecureString
             $len = 0; try { $len = $sec.Length } catch { }
@@ -1668,6 +1769,7 @@ function Read-ParameterValue {
                 return $null
             }
             $script:ParamSecret = $true
+            if ($elem -eq [pscredential]) { return [pscredential]::new($credUser, $sec) }
             if ($elem -eq [securestring]) { return $sec }
             return [System.Net.NetworkCredential]::new('', $sec).Password   # string-typed secret: bind plaintext, masked in preview/logs
         }
@@ -1872,7 +1974,7 @@ function Save-ResultCsv {
 function Show-Result {
     param($Result, [string] $Cmdlet)
 
-    $items = @($Result)
+    $items = @(Hide-SecretResult -Items $Result)
     if ($items.Count -eq 0) { Write-Host 'No objects returned.' -ForegroundColor White; return }
     Write-Host ("Returned {0} item(s)." -f $items.Count) -ForegroundColor White
 
@@ -1985,8 +2087,9 @@ function Get-NextStep {
         $opts = @('Do another task (same service)','Switch service','Quit')
         # Only surface an undo when the last Set produced a runnable revert. It is
         # opt-in here rather than a prompt after every command.
-        if ($script:LastRevert) {
-            $opts = @(('Undo the last change ({0})' -f $script:LastRevert.Cmdlet)) + $opts
+        if ($script:LastRevert -and -not $DryRunOnly) {
+            $lr = $script:LastRevert
+            $opts = @(('Undo the last change ({0} on {1}, made {2}{3})' -f $lr.Cmdlet, $lr.Target, $lr.Time.ToString('HH:mm'), $(if ($lr.Partial) { ', partial' } else { '' }))) + $opts
         }
         $choice = Get-MenuChoice -Title 'What next?' -Options $opts
         if ($choice -like 'Undo the last change*') {
@@ -2047,6 +2150,10 @@ function Start-M365Toolkit {
     # Show-Result; in-memory only (not persisted across sessions).
     $script:LastResult = @()
     $script:LastResultCmdlet = $null
+    # The undo offer lives for this run only (under 'iex' script scope is the
+    # shell's, so a stale undo from an earlier run must not survive).
+    $script:LastRevert = $null
+    $script:CurrentService = $null
 
     # Snapshot the commands that exist BEFORE connecting to any service (core
     # PowerShell + this toolkit's own functions). After a service connects, its
@@ -2072,7 +2179,7 @@ function Start-M365Toolkit {
     Start-Transcript -Path $script:LogFile -Append | Out-Null
     try {
         Write-Host '=====================================================' -ForegroundColor White
-        Write-Host '  Microsoft 365 Guided Command Builder  (v0.26)'       -ForegroundColor White
+        Write-Host '  Microsoft 365 Guided Command Builder  (v0.27)'       -ForegroundColor White
         Write-Host '=====================================================' -ForegroundColor White
 
         $cfg = Get-ToolkitConfig
@@ -2108,6 +2215,8 @@ function Start-M365Toolkit {
                 }
             }
             Save-ToolkitConfig -Upn $upn -LastService $svcName
+            if ($script:LastRevert -and $script:LastRevert.Service -ne $svcName) { $script:LastRevert = $null }   # an undo belongs to the service it was made in
+            $script:CurrentService = $svcName
 
             # Inner loop: pick and run actions for this service.
             while ($true) {
