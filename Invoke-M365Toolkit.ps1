@@ -16,7 +16,7 @@
       3. $Actions   - plain-language catalogue: friendly label -> cmdlet.
 
 .NOTES
-    v0.27 - 2026-10-25. Engine runs on PowerShell 7+ (Windows/macOS/Linux) and
+    v0.28 - 2026-10-25. Engine runs on PowerShell 7+ (Windows/macOS/Linux) and
     Windows PowerShell 5.1. Per service: Exchange, Purview, Entra, Intune and Teams
     work everywhere; SharePoint (PnP) needs pwsh 7.2+; SharePoint Admin (SPO) and
     Power Platform use Windows-only modules and run on Windows only.
@@ -26,9 +26,16 @@
 [CmdletBinding()]
 param(
     # Skip the run confirmation and only ever show the preview (never execute).
-    [switch]$DryRunOnly
+    [switch]$DryRunOnly,
+    # Sign in to Graph (Entra, Intune) with a device code instead of the browser.
+    # Use it only if the browser sign-in hangs (seen on macOS): many tenants block
+    # device code flow because it is a common phishing route.
+    [switch]$UseDeviceCode
 )
 
+# Run with 'Stop', but remember the caller's setting: under 'irm | iex' this scope
+# is the caller's own shell, which gets its setting back when the tool exits.
+$script:CallerErrorActionPreference = $ErrorActionPreference
 $ErrorActionPreference = 'Stop'
 
 # Where logs and CSV exports go. Prefer the script's own folder, but when the
@@ -60,9 +67,12 @@ $Services = @(
         Name        = 'Entra / Identity (Graph)'
         Module      = 'Microsoft.Graph'
         ConnectCmd  = 'Connect-MgGraph'
-        # UseDeviceCode: print a URL + code to sign in, instead of auto-opening a
-        # browser (which hangs silently on macOS / pwsh). You authenticate once.
-        ConnectArgs = { param($Upn) @{ Scopes = 'User.Read.All','GroupMember.Read.All'; UseDeviceCode = $true } }
+        # Browser sign-in by default; -UseDeviceCode switches to a device code (only if
+        # the browser hangs). ContextScope Process keeps the token in this process only,
+        # not in the user's token cache, so it ends with the session.
+        Scopes         = @('User.Read.All','GroupMember.Read.All')
+        CommandModules = @('Microsoft.Graph.Users','Microsoft.Graph.Groups','Microsoft.Graph.Identity.DirectoryManagement')
+        ConnectArgs = { param($Upn, $Svc) $a = @{ Scopes = $Svc.Scopes; ContextScope = 'Process' }; if ($UseDeviceCode) { $a.UseDeviceCode = $true }; $a }
         Disconnect  = 'Disconnect-MgGraph'
     }
     [pscustomobject]@{
@@ -71,6 +81,7 @@ $Services = @(
         ConnectCmd  = 'Connect-PnPOnline'
         ConnectArgs = { param($Upn) @{ Url = (Read-Host 'SharePoint site/admin URL'); Interactive = $true } }
         Disconnect  = 'Disconnect-PnPOnline'
+        MinPSVersion = '7.4'   # PnP.PowerShell 3.x needs PowerShell 7.4 or later
     }
     [pscustomobject]@{
         Name        = 'Microsoft Teams'
@@ -103,7 +114,9 @@ $Services = @(
         # Read-only (least privilege): the only catalogued Intune action lists
         # enrolled devices (Get-MgDeviceManagementManagedDevice). If a write
         # action is ever added, widen the matching scope to .ReadWrite.All then.
-        ConnectArgs = { param($Upn) @{ Scopes = 'DeviceManagementManagedDevices.Read.All','DeviceManagementConfiguration.Read.All'; UseDeviceCode = $true } }
+        Scopes         = @('DeviceManagementManagedDevices.Read.All')
+        CommandModules = @('Microsoft.Graph.DeviceManagement')
+        ConnectArgs = { param($Upn, $Svc) $a = @{ Scopes = $Svc.Scopes; ContextScope = 'Process' }; if ($UseDeviceCode) { $a.UseDeviceCode = $true }; $a }
         Disconnect  = 'Disconnect-MgGraph'
     }
     [pscustomobject]@{
@@ -647,6 +660,9 @@ function Connect-M365Service {
     if ($Service.WinOnly -and ($IsWindows -eq $false)) {
         throw "'$($Service.Name)' uses a Windows-only module ($($Service.Module)) that Microsoft does not provide for macOS/Linux. Run this service from Windows (PowerShell 5.1 or 7)."
     }
+    if ($Service.MinPSVersion -and $PSVersionTable.PSVersion -lt [version]$Service.MinPSVersion) {
+        throw "'$($Service.Name)' needs PowerShell $($Service.MinPSVersion) or later (this is $($PSVersionTable.PSVersion))."
+    }
     if (-not (Get-Module -ListAvailable -Name $Service.Module)) {
         Write-Host ("Module '{0}' is not installed." -f $Service.Module) -ForegroundColor Yellow
         if ((Read-Host 'Install it now for the current user? (y/n)') -match '^(y|yes)$') {
@@ -662,20 +678,112 @@ function Connect-M365Service {
     # connect. It is harmless here (the toolkit formats its own output), so
     # swallow all import noise and never let it stop us.
     try { Import-Module $Service.Module -ErrorAction SilentlyContinue -WarningAction SilentlyContinue 2>$null } catch { }
-    $connectArgs = & $Service.ConnectArgs $Upn
+    $connectArgs = & $Service.ConnectArgs $Upn $Service
     Write-Host ("Connecting to {0} as {1} ..." -f $Service.Name, $Upn) -ForegroundColor White
     # Pause the transcript across the sign-in so a device code / interactive secret
     # is never written to the on-disk log, then resume (append) to the same file.
     $transcriptPaused = $false
     try { Stop-Transcript | Out-Null; $transcriptPaused = $true } catch { }
     try {
-        & $Service.ConnectCmd @connectArgs
+        $script:LastConnectResult = & $Service.ConnectCmd @connectArgs
     } finally {
         if ($transcriptPaused -and $script:LogFile) {
             try { Start-Transcript -Path $script:LogFile -Append | Out-Null } catch { }
         }
     }
     Write-Host ("Connected to {0}." -f $Service.Name) -ForegroundColor Green
+}
+
+# ---------------------------------------------------------------------------
+# The commands "Run any command" offers for a service: that service's own
+# commands only. Exchange Online and Purview load their data cmdlets into a temp
+# module that Get-ConnectionInformation names; the others list their modules.
+# Sign-in commands and raw request cmdlets stay out: they could switch account,
+# tenant or scopes, or call any endpoint, outside the tool's gates.
+# ---------------------------------------------------------------------------
+function Get-ServiceCommands {
+    param([Parameter(Mandatory)] $Service)
+    $cmds = @()
+    if ($Service.Module -eq 'ExchangeOnlineManagement') {
+        $isIpps = $Service.ConnectCmd -eq 'Connect-IPPSSession'
+        $ci = @(Get-ConnectionInformation -ErrorAction SilentlyContinue |
+                Where-Object { $_.State -eq 'Connected' -and ([bool]("$($_.ConnectionUri)" -match 'compliance')) -eq $isIpps })
+        foreach ($m in @($ci | ForEach-Object { $_.ModuleName } | Where-Object { $_ } | Select-Object -Unique)) {
+            $cmds += @(Get-Command -Module $m -CommandType Cmdlet,Function -ErrorAction SilentlyContinue)
+        }
+    } else {
+        $mods = if ($Service.CommandModules) { $Service.CommandModules } else { @($Service.Module) }
+        foreach ($m in $mods) { $cmds += @(Get-Command -Module $m -CommandType Cmdlet,Function -ErrorAction SilentlyContinue) }
+    }
+    @($cmds | Where-Object { $_.Name -notmatch '^(Connect|Disconnect)-' -and $_.Name -notmatch '^Invoke-.*(Request|RestMethod|GraphMethod)$' } |
+        Sort-Object Name -Unique)
+}
+
+# The account a service session is really signed in as (the typed email is only a
+# hint for some services, and the browser can pick another account or tenant).
+# $null when the service gives no way to read it back.
+function Get-SignedInAccount {
+    param([Parameter(Mandatory)] $Service)
+    try {
+        if ($Service.Module -eq 'ExchangeOnlineManagement') {
+            $isIpps = $Service.ConnectCmd -eq 'Connect-IPPSSession'
+            $ci = Get-ConnectionInformation -ErrorAction SilentlyContinue |
+                  Where-Object { $_.State -eq 'Connected' -and ([bool]("$($_.ConnectionUri)" -match 'compliance')) -eq $isIpps } | Select-Object -Last 1
+            if ($ci) { return [pscustomobject]@{ Account = [string]$ci.UserPrincipalName; Tenant = [string]$ci.Organization; Scopes = $null } }
+        } elseif ($Service.ConnectCmd -eq 'Connect-MgGraph') {
+            $ctx = Get-MgContext -ErrorAction SilentlyContinue
+            if ($ctx) { return [pscustomobject]@{ Account = [string]$ctx.Account; Tenant = [string]$ctx.TenantId; Scopes = @($ctx.Scopes) } }
+        } elseif ($Service.ConnectCmd -eq 'Connect-MicrosoftTeams' -and $script:LastConnectResult) {
+            $r = $script:LastConnectResult | Select-Object -First 1
+            $acct = if ($r.Account.Id) { [string]$r.Account.Id } else { [string]$r.Account }
+            if ($acct) { return [pscustomobject]@{ Account = $acct; Tenant = [string]$r.Tenant.Id; Scopes = $null } }
+        }
+    } catch { }
+    return $null
+}
+
+# Sign out of one service. Purview shares Exchange Online's sign-out.
+function Disconnect-M365Service {
+    param([Parameter(Mandatory)] $Service)
+    $dc = if ($Service.Disconnect) { $Service.Disconnect } elseif ($Service.Module -eq 'ExchangeOnlineManagement') { 'Disconnect-ExchangeOnline' } else { $null }
+    if (-not $dc) { return }
+    $cmd = Get-Command $dc -ErrorAction SilentlyContinue
+    if (-not $cmd) { return }
+    $a = @{}
+    if ($cmd.Parameters.ContainsKey('Confirm')) { $a.Confirm = $false }
+    try   { & $dc @a -ErrorAction Stop *> $null; Write-Host ('Signed out of {0}.' -f $Service.Name) -ForegroundColor White }
+    catch { Write-Host ('Could not sign out of {0}: {1}' -f $Service.Name, $_.Exception.Message) -ForegroundColor Yellow }
+}
+
+# Why a command needs a typed confirmation, or $null for a plain y. Read verbs
+# never do. Destructive verbs, Invoke- actions (wipe, retire...) and raw non-GET
+# requests, changes to admin roles or mail flow, purge/force switches and mail
+# forwarding (the classic account-takeover step) all do.
+function Get-DestructiveReason {
+    param([Parameter(Mandatory)] [string] $Cmdlet, [System.Collections.IDictionary] $Bound)
+    $verb, $noun = $Cmdlet -split '-', 2
+    if (@('Get','Test','Search','Find','Show','Measure','Compare','Resolve') -contains $verb) { return $null }
+    if (@('Remove','Disable','Delete','Reset','Clear','Revoke','Uninstall','Deprovision','Stop','Block','Suspend','Unregister','Purge') -contains $verb) {
+        return ('{0} is destructive and has no automatic undo' -f $verb)
+    }
+    if ($verb -eq 'Invoke') {
+        if ($noun -match '(Request|RestMethod|GraphMethod)$') {
+            $m = if ($Bound -and $Bound.Contains('Method') -and $Bound['Method']) { "$($Bound['Method'])".ToUpper() } else { 'GET' }
+            if ($m -notin @('GET','HEAD')) { return ('it sends a raw {0} request' -f $m) }
+        } else { return 'it runs an Invoke- action (such as a wipe or retire)' }
+    }
+    if ($noun -match '(RoleGroupMember|RoleAssignment|DirectoryRoleMember|RoleMember|TransportRule|JournalRule|InboxRule)') {
+        return 'it changes admin roles or mail flow'
+    }
+    if ($Bound) {
+        foreach ($k in @('Purge','PurgeType','PermanentlyDelete','HardDelete','DeleteContent','Force')) {
+            if ($Bound.Contains($k) -and $Bound[$k] -and -not ($Bound[$k] -is [switch] -and -not $Bound[$k].IsPresent)) { return ('it uses -{0}' -f $k) }
+        }
+        foreach ($k in @('ForwardingSmtpAddress','ForwardingAddress','ForwardTo','RedirectTo','ForwardAsAttachmentTo')) {
+            if ($Bound.Contains($k) -and $Bound[$k]) { return 'it forwards mail elsewhere' }
+        }
+    }
+    return $null
 }
 
 # ---------------------------------------------------------------------------
@@ -984,16 +1092,15 @@ function ConvertTo-ParamValue {
 # the row count in bulk, where one keypress would otherwise hit every row.
 # Everything else needs an explicit y. Returns $true to go ahead.
 function Confirm-Execution {
-    param([Parameter(Mandatory)] [string] $Cmdlet, [int] $RowCount = 0)
-    $destructiveVerbs = @('Remove','Disable','Delete','Reset','Clear','Revoke','Uninstall','Deprovision')
-    $verb = ($Cmdlet -split '-',2)[0]
-    if ($destructiveVerbs -contains $verb) {
+    param([Parameter(Mandatory)] [string] $Cmdlet, [int] $RowCount = 0, [System.Collections.IDictionary] $Bound)
+    $reason = Get-DestructiveReason -Cmdlet $Cmdlet -Bound $Bound
+    if ($reason) {
         Write-Host ''
         if ($RowCount -gt 0) {
-            Write-Host ('[!] {0} is DESTRUCTIVE, has no automatic undo, and will run for {1} row(s).' -f $Cmdlet, $RowCount) -ForegroundColor Red
+            Write-Host ('[!] {0}: {1}, and it will run for {2} row(s).' -f $Cmdlet, $reason, $RowCount) -ForegroundColor Red
             $expect = '{0} {1}' -f $Cmdlet, $RowCount
         } else {
-            Write-Host ('[!] {0} is DESTRUCTIVE and has no automatic undo.' -f $Cmdlet) -ForegroundColor Red
+            Write-Host ('[!] {0}: {1}.' -f $Cmdlet, $reason) -ForegroundColor Red
             $expect = $Cmdlet
         }
         $typed = ("$(Read-Host ('To proceed, type exactly: {0}  (anything else cancels)' -f $expect))".Trim()) -replace '\s+', ' '
@@ -1071,7 +1178,8 @@ function Invoke-GuidedCmdlet {
         [hashtable] $Hints,      # optional per-action allowed-value overrides (name -> values)
         [hashtable] $Transform,  # optional post-processing of collected values (name -> scriptblock)
         [scriptblock] $Project,  # optional reshaping of the RESULT before display (raw result -> clean objects)
-        [hashtable] $Candidates  # optional dependent pick-lists (name -> { param($bound) ... }): valid values derived from fields already chosen
+        [hashtable] $Candidates, # optional dependent pick-lists (name -> { param($bound) ... }): valid values derived from fields already chosen
+        [switch]    $Resolve     # check typed identities against the directory (catalogued actions; run-any skips it)
     )
 
     $cmd      = Get-Command $Cmdlet -ErrorAction Stop
@@ -1120,7 +1228,7 @@ function Invoke-GuidedCmdlet {
     while ($ri -lt $reqList.Count) {
         $p = $reqList[$ri]
         $desc = Get-ParamDescription -Name $p.Name -ParamHelp $ParamHelp -Cmdlet $Cmdlet
-        $val = Read-ParameterValue -Param $p -Required -Description $desc -Hints $Hints -Candidates $Candidates -Bound $bound
+        $val = Read-ParameterValue -Param $p -Required -Description $desc -Hints $Hints -Candidates $Candidates -Bound $bound -Resolve:$Resolve
         if ($script:ParamCancel) { Write-Host 'Cancelled - back to the menu (nothing was run).' -ForegroundColor White; return }
         if ($script:ParamBack) {
             if ($ri -eq 0) { Write-Host "  Already at the first field - type 'cancel' to return to the menu." -ForegroundColor White; continue }
@@ -1137,7 +1245,7 @@ function Invoke-GuidedCmdlet {
     # ---- Optional params named in the curated list: ask them outright.
     foreach ($p in ($optional | Where-Object { $promptList -contains $_.Name -and -not $bound.Contains($_.Name) })) {
         $desc = Get-ParamDescription -Name $p.Name -ParamHelp $ParamHelp -Cmdlet $Cmdlet
-        $v = Read-ParameterValue -Param $p -Description $desc -Hints $Hints -Candidates $Candidates -Bound $bound
+        $v = Read-ParameterValue -Param $p -Description $desc -Hints $Hints -Candidates $Candidates -Bound $bound -Resolve:$Resolve
         # 'cancel' aborts the whole action; 'back' on an OPTIONAL field just skips it.
         if ($script:ParamCancel) { Write-Host 'Cancelled - back to the menu (nothing was run).' -ForegroundColor White; return }
         if (-not $script:ParamBack -and $null -ne $v) { $bound[$p.Name] = $v; if ($script:ParamSecret) { $secretKeys.Add($p.Name) } }
@@ -1152,7 +1260,7 @@ function Invoke-GuidedCmdlet {
         Write-Host ''
         Write-Host ("Optional: {0} - enter it now, or press Enter to skip." -f $p.Name) -ForegroundColor White
         $desc = Get-ParamDescription -Name $p.Name -ParamHelp $ParamHelp -Cmdlet $Cmdlet
-        $v = Read-ParameterValue -Param $p -Description $desc -Hints $Hints -Candidates $Candidates -Bound $bound
+        $v = Read-ParameterValue -Param $p -Description $desc -Hints $Hints -Candidates $Candidates -Bound $bound -Resolve:$Resolve
         # 'cancel' aborts the whole action; 'back' on an OPTIONAL field just skips it.
         if ($script:ParamCancel) { Write-Host 'Cancelled - back to the menu (nothing was run).' -ForegroundColor White; return }
         if (-not $script:ParamBack -and $null -ne $v) { $bound[$p.Name] = $v; if ($script:ParamSecret) { $secretKeys.Add($p.Name) } }
@@ -1179,7 +1287,7 @@ function Invoke-GuidedCmdlet {
             if ($idx -ge 0 -and $idx -lt $optRest.Count) {
                 $p = $optRest[$idx]
                 $desc = Get-ParamDescription -Name $p.Name -ParamHelp $ParamHelp -Cmdlet $Cmdlet
-                $v = Read-ParameterValue -Param $p -Description $desc -Hints $Hints -Candidates $Candidates -Bound $bound
+                $v = Read-ParameterValue -Param $p -Description $desc -Hints $Hints -Candidates $Candidates -Bound $bound -Resolve:$Resolve
                 # 'cancel' aborts the whole action; 'back' just skips this optional pick.
                 if ($script:ParamCancel) { Write-Host 'Cancelled - back to the menu (nothing was run).' -ForegroundColor White; return }
                 if (-not $script:ParamBack -and $null -ne $v) { $bound[$p.Name] = $v; if ($script:ParamSecret) { $secretKeys.Add($p.Name) } }
@@ -1256,7 +1364,7 @@ function Invoke-GuidedCmdlet {
     Write-CommandColored -Command $preview
     # Destructive verbs need the command name typed; everything else an explicit y.
     # Same gate as the bulk runner (Confirm-Execution).
-    if (-not (Confirm-Execution -Cmdlet $Cmdlet)) {
+    if (-not (Confirm-Execution -Cmdlet $Cmdlet -Bound $bound)) {
         Write-Host 'Cancelled - nothing was run.' -ForegroundColor White
         return
     }
@@ -1583,7 +1691,9 @@ function Invoke-BulkCmdlet {
     Write-Host ''
     Write-Host ('FINAL CONFIRMATION - about to run {0} for {1} row(s).' -f $Cmdlet, $todo.Count) -ForegroundColor Yellow
     if ($skipVendorConfirm) { Write-Host '  (the cmdlet''s own per-row confirmation is skipped - this one covers every row)' -ForegroundColor White }
-    if (-not (Confirm-Execution -Cmdlet $Cmdlet -RowCount $todo.Count)) {
+    $boundUnion = [ordered]@{}   # every parameter any row binds, so forwarding or -Force in one row counts
+    foreach ($pl in $todo) { foreach ($k in $pl.Splat.Keys) { if (-not $boundUnion.Contains($k) -or $null -eq $boundUnion[$k]) { $boundUnion[$k] = $pl.Splat[$k] } } }
+    if (-not (Confirm-Execution -Cmdlet $Cmdlet -RowCount $todo.Count -Bound $boundUnion)) {
         Write-Host 'Cancelled - nothing was run.' -ForegroundColor White; return
     }
 
@@ -1712,7 +1822,8 @@ function Read-ParameterValue {
         [string] $Description,  # plain-language "what is this field?" shown above the prompt
         [hashtable] $Hints,     # per-action allowed-value override (name -> values); beats global $ParamHints
         [hashtable] $Candidates, # per-action dependent pick-lists (name -> { param($bound) ... }) derived from fields already chosen
-        $Bound                  # values collected so far (an [ordered] dict), passed to a Candidates scriptblock
+        $Bound,                 # values collected so far (an [ordered] dict), passed to a Candidates scriptblock
+        [switch] $Resolve       # verify a typed identity is a real recipient/user (catalogued actions only)
     )
     $script:ParamBack   = $false  # cleared each prompt; set if the user types 'back'   (go to previous field)
     $script:ParamCancel = $false  # cleared each prompt; set if the user types 'cancel' (abort action to menu)
@@ -1916,7 +2027,7 @@ function Read-ParameterValue {
         if ([string]::IsNullOrWhiteSpace($val)) { return $null }
         # Identity-style fields: verify the typed value is a real recipient/user.
         # Catches nonsense/typos instead of silently accepting them as an address.
-        if ($canFind -and $lookup.Resolve -and -not $isArray) {
+        if ($Resolve -and $canFind -and $lookup.Resolve -and -not $isArray) {
             $match = $null
             try { $match = & $lookup.Resolve $val } catch { }
             if (-not $match) {
@@ -2056,24 +2167,35 @@ function Save-ToolkitConfig {
 }
 
 # ---------------------------------------------------------------------------
-# "Who am I" preflight: after connecting, show the identity in use (and the
-# granted Graph scopes / EXO org) so you know your blast radius before acting.
+# "Who am I" preflight: after connecting, show the account the session is REALLY
+# signed in as (not just the email typed at start), its tenant, and for Graph the
+# granted scopes. A mismatch with the typed email stops until you confirm.
+# Returns $false when you decline, so the caller can sign out again.
 # ---------------------------------------------------------------------------
 function Show-WhoAmI {
     param([Parameter(Mandatory)] $Service, [string] $Upn)
-    Write-Host ("Connected as: {0}" -f $Upn) -ForegroundColor Green
-    try {
-        if ($Service.Module -eq 'ExchangeOnlineManagement') {
-            $ci = Get-ConnectionInformation -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($ci) { Write-Host ("  Org: {0}  |  UPN: {1}" -f $ci.Organization, $ci.UserPrincipalName) -ForegroundColor White }
-        } elseif ($Service.Module -like 'Microsoft.Graph*') {
-            $ctx = Get-MgContext -ErrorAction SilentlyContinue
-            if ($ctx) {
-                Write-Host ("  Account: {0}" -f $ctx.Account) -ForegroundColor White
-                Write-Host ("  Granted scopes: {0}" -f ($ctx.Scopes -join ', ')) -ForegroundColor White
-            }
+    $who = Get-SignedInAccount -Service $Service
+    if (-not $who -or -not $who.Account) {
+        Write-Host ("You typed {0}. {1} gives no way to read the signed-in account back - check the sign-in window used the right one." -f $Upn, $Service.Name) -ForegroundColor Yellow
+        return $true
+    }
+    Write-Host ("Signed in as: {0}" -f $who.Account) -ForegroundColor Green
+    if ($who.Tenant) { Write-Host ("  Tenant: {0}" -f $who.Tenant) -ForegroundColor White }
+    if ($who.Scopes) {
+        Write-Host ("  Granted scopes: {0}" -f ($who.Scopes -join ', ')) -ForegroundColor White
+        # A delegated token carries every scope ever consented to this app, not only
+        # the ones requested, so "read-only" is a minimum. Say so when it matters.
+        $extra = @($who.Scopes | Where-Object { $Service.Scopes -notcontains $_ -and $_ -notin @('openid','profile','offline_access','email') })
+        $write = @($extra | Where-Object { $_ -match 'Write|Manage|FullControl|AccessAsUser|PrivilegedAccess' })
+        if ($write.Count -gt 0) {
+            Write-Host ("  [!] This token can also WRITE (consented earlier): {0}. 'Run any command' can use these." -f ($write -join ', ')) -ForegroundColor Yellow
         }
-    } catch { }
+    }
+    if ($Upn -and $who.Account -ne $Upn) {
+        Write-Host ("[!] You typed {0}, but this session is signed in as {1}." -f $Upn, $who.Account) -ForegroundColor Red
+        if ((Read-Host ('Continue as {0}? (y/n)' -f $who.Account)) -notmatch '^(y|yes)$') { return $false }
+    }
+    return $true
 }
 
 # ---------------------------------------------------------------------------
@@ -2134,7 +2256,7 @@ function Invoke-Action {
         if ($mode -like 'Bulk*') {
             Invoke-BulkCmdlet  -Cmdlet $Action.Cmdlet -Prompt $Action.Prompt -ParamHelp $Action.ParamHelp -Preset $Action.Preset -Hints $Action.Hints -Transform $Action.Transform -Resolve
         } else {
-            Invoke-GuidedCmdlet -Cmdlet $Action.Cmdlet -Prompt $Action.Prompt -Help $Action.Help -ParamHelp $Action.ParamHelp -Preset $Action.Preset -Hints $Action.Hints -Transform $Action.Transform -Project $Action.Project -Candidates $Action.Candidates
+            Invoke-GuidedCmdlet -Cmdlet $Action.Cmdlet -Prompt $Action.Prompt -Help $Action.Help -ParamHelp $Action.ParamHelp -Preset $Action.Preset -Hints $Action.Hints -Transform $Action.Transform -Project $Action.Project -Candidates $Action.Candidates -Resolve
         }
     } catch [System.IO.EndOfStreamException] { throw }
     catch { Write-Host ("Could not run '{0}': {1}" -f $Action.Label, $_.Exception.Message) -ForegroundColor Red }
@@ -2155,13 +2277,6 @@ function Start-M365Toolkit {
     $script:LastRevert = $null
     $script:CurrentService = $null
 
-    # Snapshot the commands that exist BEFORE connecting to any service (core
-    # PowerShell + this toolkit's own functions). After a service connects, its
-    # cmdlets are whatever appeared on top of this baseline - a module-agnostic
-    # way to list a service's commands (EXO v3 loads its data cmdlets into a
-    # dynamically-named temp module, so filtering by module name would miss them).
-    $script:BaselineCommands = @(Get-Command -CommandType Cmdlet,Function -ErrorAction SilentlyContinue |
-                                    Select-Object -ExpandProperty Name -Unique)
 
     $logDir = Join-Path $script:ToolkitHome 'logs'
     if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out-Null }
@@ -2179,7 +2294,7 @@ function Start-M365Toolkit {
     Start-Transcript -Path $script:LogFile -Append | Out-Null
     try {
         Write-Host '=====================================================' -ForegroundColor White
-        Write-Host '  Microsoft 365 Guided Command Builder  (v0.27)'       -ForegroundColor White
+        Write-Host '  Microsoft 365 Guided Command Builder  (v0.28)'       -ForegroundColor White
         Write-Host '=====================================================' -ForegroundColor White
 
         $cfg = Get-ToolkitConfig
@@ -2206,8 +2321,16 @@ function Start-M365Toolkit {
                 # drop back to the service menu so the user can retry or pick another.
                 try {
                     Connect-M365Service -Service $service -Upn $upn
+                    # Services that share one sign-in (Entra and Intune both use
+                    # Connect-MgGraph) replace each other's session: only the latest counts.
+                    foreach ($other in @($Services | Where-Object { $_.ConnectCmd -eq $service.ConnectCmd -and $_.Name -ne $svcName })) { $connected.Remove($other.Name) }
                     $connected[$svcName] = $true
-                    Show-WhoAmI -Service $service -Upn $upn
+                    if (-not (Show-WhoAmI -Service $service -Upn $upn)) {
+                        Disconnect-M365Service -Service $service
+                        $connected.Remove($svcName)
+                        Write-Host 'Back to the service menu.' -ForegroundColor White
+                        continue
+                    }
                 } catch {
                     Write-Host ("Could not connect to {0}: {1}" -f $svcName, $_.Exception.Message) -ForegroundColor Red
                     Write-Host 'Back to the service menu - try again, or pick another service / Quit.' -ForegroundColor White
@@ -2264,18 +2387,14 @@ function Start-M365Toolkit {
                 if ($cat -eq 'Run any command by name (advanced)') {
                     # Browse the connected service's commands with NO typing: pick a verb
                     # (Get / Set / New ...), then pick the command. "Type a name or keyword"
-                    # stays available for people who know the name. Commands are scoped to
-                    # whatever this service added on top of the pre-connect baseline.
-                    $svcCmds = @(Get-Command -CommandType Cmdlet,Function -ErrorAction SilentlyContinue |
-                                    Where-Object { $script:BaselineCommands -notcontains $_.Name })
+                    # stays available for people who know the name.
+                    # Only this service's own commands (Get-ServiceCommands) - never local
+                    # system cmdlets (Remove-Item, Invoke-Expression, ...), another
+                    # service's commands, sign-in commands or raw request cmdlets.
+                    $svcCmds = @(Get-ServiceCommands -Service $service)
                     if ($svcCmds.Count -eq 0) {
-                        # e.g. Graph loads sub-modules on demand, so the baseline diff
-                        # can come back empty. Fall back to the connected service's OWN
-                        # module commands (wildcard covers meta-modules like
-                        # Microsoft.Graph.* that load sub-modules) - NOT every command in
-                        # the session, so the advanced hatch can't reach unrelated local
-                        # system cmdlets (Remove-Item, Stop-Process, ...).
-                        $svcCmds = @(Get-Command -CommandType Cmdlet,Function -Module "$($service.Module)*" -ErrorAction SilentlyContinue)
+                        Write-Host ("No commands found for {0} - is the session still connected?" -f $svcName) -ForegroundColor Yellow
+                        continue
                     }
                     $verbs = @($svcCmds | ForEach-Object { $_.Verb } | Where-Object { $_ } | Sort-Object -Unique)
                     $cmdName = $null
@@ -2354,7 +2473,20 @@ function Start-M365Toolkit {
         Write-Host 'Input ended - exiting.' -ForegroundColor White
     }
     finally {
-        Stop-Transcript | Out-Null
+        # Sign out of every service this run connected to, so no admin session stays
+        # live in the shell after Quit (under 'irm | iex' that shell is the caller's).
+        if ($connected) {
+            $signedOut = @()
+            foreach ($n in @($connected.Keys)) {
+                $svc = $Services | Where-Object { $_.Name -eq $n }
+                $dc  = if ($svc.Disconnect) { $svc.Disconnect } else { 'Disconnect-ExchangeOnline' }
+                if ($signedOut -contains $dc) { continue }
+                $signedOut += $dc
+                Disconnect-M365Service -Service $svc
+            }
+        }
+        try { Stop-Transcript | Out-Null } catch { }
+        Set-Variable -Name ErrorActionPreference -Scope Script -Value $script:CallerErrorActionPreference
     }
 }
 
