@@ -60,7 +60,8 @@ In PowerShell (pwsh 7 on Windows/macOS/Linux, or Windows PowerShell 5.1) with th
 
 ```powershell
 cd M365Toolkit
-# Safe first run: preview commands, never execute anything
+# Preview mode: never runs a change. It still signs in, reads the tenant for lookups,
+# and can install a missing module, so it is not offline.
 .\Invoke-M365Toolkit.ps1 -DryRunOnly
 # Normal run (asks y/n before running each command)
 .\Invoke-M365Toolkit.ps1
@@ -74,7 +75,7 @@ After each sign-in the tool shows the account the session is really signed in as
 stops if it differs from the email you typed. On Quit it signs out of every service it
 connected to.
 
-### Run it remotely (once the repo is public)
+### Run it remotely
 
 > **⚠️ Security note.** `irm … | iex` downloads and runs a script directly in your
 > admin session — the same trust model as `curl … | bash`. **Read the script first**,
@@ -94,9 +95,9 @@ For the safe dry-run preview mode over the network:
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/oracola91/m365-toolkit/v0.24/Invoke-M365Toolkit.ps1))) -DryRunOnly
 ```
 
-Run this way there is no local file, so logs and CSV exports go to `%USERPROFILE%\M365Toolkit\`.
-Using a tag (not `main`) also avoids the CDN-cache lag on fresh pushes. (The repo is
-private for now — this works once it's switched to public.)
+Run this way there is no local file, so logs and CSV exports go to `%USERPROFILE%\M365Toolkit\`
+on Windows or `~/M365Toolkit` on macOS and Linux. Using a tag (not `main`) also avoids the
+CDN-cache lag on fresh pushes.
 
 If a required module isn't installed, the tool offers to install it for the current user.
 
@@ -115,15 +116,13 @@ If a required module isn't installed, the tool offers to install it for the curr
 
 Catalogued actions cover the common jobs, grouped by category:
 
-- **Mailbox access** — grant/remove access to a mailbox, Send As.
-- **Shared mailboxes** — create a shared mailbox, convert an existing mailbox to shared,
-  give Full Access with control over auto-mapping.
-- **Mailboxes** — look up a mailbox, change a mailbox setting.
-- **Groups** — add a member to a distribution group.
-- **Users** (Graph) — look up a user.
-- **Sites** (SharePoint Admin/SPO) — list all SharePoint sites.
-- **Devices** (Intune/Graph) — list enrolled devices.
-- **Environments** (Power Platform) — list environments.
+- **Exchange Online.** Check access (who has access to a mailbox or calendar, who can Send As,
+  which mail groups or shared mailboxes a user has, who is in a distribution group); Give access
+  (mailbox, Send As, calendar, distribution group); Remove and change access (mailbox and
+  calendar); Mailboxes (look up, change a setting, create or convert shared mailboxes).
+- **Entra / Identity (Graph).** Look up a user; see which groups a user is directly in.
+- **SharePoint Admin (SPO).** List all sites. **Intune / Devices (Graph).** List enrolled
+  devices. **Power Platform (admin).** List environments.
 
 **Beyond the catalogue — full capability:** every category menu has a
 **"Run any command by name (advanced)"** option. Type any cmdlet in the connected module
@@ -136,7 +135,9 @@ UTF-8 or Excel's ANSI encoding, `,` or `;` separated).
 
 **Results / export:** when a command returns objects (e.g. a lookup), the tool offers to
 show them as a table, show only columns you choose, or **export to CSV** (all columns or a
-chosen subset). CSVs default to `.\exports\<cmdlet>-<timestamp>.csv`.
+chosen subset). CSVs default to the tool's `exports` folder (next to the script). They are
+owner-only, formula cells are written as text, and the tool deletes its own exports after 30
+days; a path you type elsewhere is not cleaned up.
 
 **Convenience:** the tool remembers your email (UPN) and last-used service between runs
 (stored in `config.json`, never committed); after connecting it shows **who you're signed
@@ -168,48 +169,29 @@ If a parameter has fixed values but the cmdlet hides them (common with Exchange 
 proxy cmdlets that expose things as `Object[]`), teach the tool by adding a row to
 `$ParamHints` (keyed by parameter name), e.g. `AccessRights = @('FullAccess','SendAs',...)`.
 
-## Status / roadmap
+## Tests
 
-- **v0.8 (2026-07-07):** **Calendar access** category — see who has access to a mailbox's
-  calendar, and grant / change / remove a role (Reviewer, Editor, AvailabilityOnly, …); the
-  mailbox's `\Calendar` folder is targeted automatically, so you only type the person. Merged
-  the shared "Give Full Access" action into the general grant (auto-mapping is now an optional
-  parameter there). Two reusable engine hooks added: per-action `Transform` (post-process a
-  collected value before it runs) and `Hints` (per-action allowed-value override, since
-  `AccessRights` means calendar *roles* here but mailbox *rights* elsewhere). Fixed
-  `Connect-ExchangeOnline` on macOS / PowerShell 7 with `-SkipLoadingFormatData` (avoids the
-  `exchange.format.ps1xml` temp-file error). **UI:** all menus now list **A-Z** (categories,
-  actions, services — last-used service still floated to the top); app controls (Search / Run
-  any command / Switch service / Quit) render below a `-- app --` divider, visually separated
-  from the menu's own items.
-- **v0.7 (2026-07-06):** prompt navigation — type `back` to re-enter the previous field or
-  `cancel` to abort to the menu; a shared numbered **multi-select** picker (`Read-OptionMenu`)
-  for fixed-set fields; and two **mailbox permission view** actions — "See who can Send As a
-  mailbox" and "See who has access to a mailbox".
-- **v0.6 (2026-07-06):** parameter-set resolution (no more spurious required params like
-  `-Owner`); `?` explains each optional/switch parameter (action help → glossary → Get-Help,
-  with `-LoadCmdletHelp` on EXO connect); validates values against allowed sets and identity
-  fields against the directory (typos/nonsense are flagged, not accepted); post-action
-  "What next?" menu (do another / switch service / quit); reports `Failed: <msg>` on error;
-  standard white/green/yellow/red colors; SendAs handled via the correct action.
-- **v0.5 (2026-07-06):** remembers UPN + last-used service; "who am I" preflight after
-  connect; **Search actions by keyword**; `find` directory lookup for identity fields.
-- **v0.4 (2026-07-06):** three more services wired — **SharePoint Admin (SPO)**,
-  **Intune / Devices (Graph)**, **Power Platform (admin)** — each with a starter list action.
-  (Runs from this Mac copy; no VM involved.)
-- **v0.3 (2026-07-06):** result handling — after a command returns objects you can show a
-  table, choose columns, or export to CSV (all or chosen columns) to `.\exports\`.
-- **v0.2 (2026-07-03):** enum + `$ParamHints` value discovery with `?` to list options;
-  per-parameter plain-language help (who → whom); `?` help in the menus; `Preset` values;
-  **Shared mailboxes** category; **run-any-cmdlet** escape hatch; **CSV bulk mode**.
-- **v0.1 (2026-07-03):** connection registry, introspection wizard, dry-run preview,
-  transcript logging, a small starter catalogue.
-- **Next / still missing:**
-  - Legacy AzureAD/MSOnline are retired (not wired, and not worth adding — migrate to Graph).
-  - No piping one action's output into the next.
-  - Interactive auth only — no app-only/certificate auth for unattended/scheduled runs.
-  - No undo, and destructive cmdlets get the same y/n prompt as a lookup.
-  - Optional plain-English → cmdlet layer (via the Claude API) so you can type a request
-    instead of navigating menus.
+The engine's logic is covered by Pester tests in `tests/` that run without a tenant (stub
+cmdlets, scripted answers). Run them with:
 
-Design notes live in the second brain: `second-brain/Knowledge/Office 365 PowerShell reference.md`.
+```powershell
+Invoke-Pester ./tests
+```
+
+GitHub Actions runs PSScriptAnalyzer and the tests on PowerShell 7 (Linux and Windows) and
+Windows PowerShell 5.1 for every push and pull request. `TEST-PLAN.md` lists the manual
+checks that need a real tenant.
+
+## Status
+
+See [CHANGELOG.md](CHANGELOG.md) for what changed in each version, and
+[SECURITY.md](SECURITY.md) to report a security problem.
+
+Known limits, on purpose:
+
+- Interactive, delegated sign-in only: no app-only or certificate auth for unattended runs.
+  Adding it would need a service-account review first.
+- Legacy AzureAD and MSOnline are retired and not supported; use the Graph services.
+- An optional plain-English layer through an external AI service was considered. It would
+  send directory data to a new party and turn model output into admin commands, so it needs
+  a security review and IT approval before anyone builds it.

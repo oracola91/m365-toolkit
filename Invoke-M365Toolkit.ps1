@@ -17,7 +17,7 @@
       3. $Actions   - plain-language catalogue: friendly label -> cmdlet.
 
 .NOTES
-    v0.29 - 2026-10-25. Engine runs on PowerShell 7+ (Windows/macOS/Linux) and
+    v0.30 - 2026-10-25. Engine runs on PowerShell 7+ (Windows/macOS/Linux) and
     Windows PowerShell 5.1. Per service: Exchange, Purview, Entra, Intune and Teams
     work everywhere; SharePoint (PnP) needs pwsh 7.2+; SharePoint Admin (SPO) and
     Power Platform use Windows-only modules and run on Windows only.
@@ -41,7 +41,7 @@ param(
 # is the caller's own shell, which gets its setting back when the tool exits.
 $script:CallerErrorActionPreference = $ErrorActionPreference
 $ErrorActionPreference = 'Stop'
-$script:ToolkitVersion = 'v0.29'
+$script:ToolkitVersion = 'v0.30'
 
 # Where logs and CSV exports go. Prefer the script's own folder, but when the
 # tool is run remotely (irm <URL> | iex) there is no script file on disk, so
@@ -460,7 +460,7 @@ $Actions = @(
         Label='See which groups a user is in'
         Cmdlet='Get-MgUserMemberOf'; Prompt=@('UserId')
         Preset=@{ All=$true }
-        Help='List EVERY group (and directory role) a user belongs to, each labelled with what it is - Distribution group, Microsoft 365 group, Security group, Mail-enabled security, or Directory role.'
+        Help='List the groups (and directory roles) a user is a DIRECT member of, each labelled with what it is - Distribution group, Microsoft 365 group, Security group, Mail-enabled security, or Directory role. Groups reached through nesting are not included.'
         ParamHelp=@{ UserId='The user whose memberships you want (email or object id). Type find to search the directory, or last to reuse someone from a previous result.' }
         # Get-MgUserMemberOf returns raw directory objects whose useful fields sit
         # in an AdditionalProperties bag. Flatten to clean Name / Email / Type so
@@ -680,7 +680,7 @@ function Get-MenuChoice {
             continue
         }
         if ($AllowBack -and ($raw -eq '0' -or $raw -eq '')) { return $null }   # Enter = Back, matches Read-Host prompts
-        if ($raw -match '^\d+$' -and [int]$raw -ge 1 -and [int]$raw -le $all.Count) {
+        if ($raw -match '^\d{1,5}$' -and [int]$raw -ge 1 -and [int]$raw -le $all.Count) {
             return $all[[int]$raw - 1]
         }
         Write-Host 'Not a valid choice, try again.' -ForegroundColor Yellow
@@ -1449,7 +1449,7 @@ function Invoke-GuidedCmdlet {
                 if ($d) { Write-Host ('        {0}' -f $d) -ForegroundColor White } else { Write-Host '        (no description available)' -ForegroundColor White }
             }
         }
-        foreach ($n in ($pick -split '[,\s]+' | Where-Object { $_ -match '^\d+$' })) {
+        foreach ($n in ($pick -split '[,\s]+' | Where-Object { $_ -match '^\d{1,5}$' })) {
             $idx = [int]$n - 1
             if ($idx -ge 0 -and $idx -lt $optRest.Count) {
                 $p = $optRest[$idx]
@@ -1481,7 +1481,7 @@ function Invoke-GuidedCmdlet {
                 if ($d) { Write-Host ('        {0}' -f $d) -ForegroundColor White } else { Write-Host '        (no description available)' -ForegroundColor White }
             }
         }
-        foreach ($n in ($pick -split '[,\s]+' | Where-Object { $_ -match '^\d+$' })) {
+        foreach ($n in ($pick -split '[,\s]+' | Where-Object { $_ -match '^\d{1,5}$' })) {
             $idx = [int]$n - 1
             if ($idx -ge 0 -and $idx -lt $swRest.Count) { $bound[$swRest[$idx].Name] = [switch]$true }   # [switch] so preview shows -Force, not -Force $true
         }
@@ -1719,7 +1719,7 @@ function Invoke-BulkCmdlet {
         Write-Host 'Optional parameters you can map:' -ForegroundColor White
         for ($i=0; $i -lt $optRest.Count; $i++) { Write-Host ('  {0,2}. {1}' -f ($i+1), $optRest[$i].Name) }
         $pick = Read-Host 'Enter numbers to map (comma-separated), or Enter to skip'
-        foreach ($n in ($pick -split '[,\s]+' | Where-Object { $_ -match '^\d+$' })) {
+        foreach ($n in ($pick -split '[,\s]+' | Where-Object { $_ -match '^\d{1,5}$' })) {
             $idx=[int]$n-1; if ($idx -ge 0 -and $idx -lt $optRest.Count) { & $askParam $optRest[$idx] $false }
         }
     }
@@ -1731,7 +1731,7 @@ function Invoke-BulkCmdlet {
         Write-Host 'Switches to enable for every row:' -ForegroundColor White
         for ($i=0; $i -lt $swRest.Count; $i++) { Write-Host ('  {0,2}. {1}' -f ($i+1), $swRest[$i].Name) }
         $pick = Read-Host 'Enter numbers to enable, or Enter to skip'
-        foreach ($n in ($pick -split '[,\s]+' | Where-Object { $_ -match '^\d+$' })) {
+        foreach ($n in ($pick -split '[,\s]+' | Where-Object { $_ -match '^\d{1,5}$' })) {
             $idx=[int]$n-1; if ($idx -ge 0 -and $idx -lt $swRest.Count) { $map[$swRest[$idx].Name] = @{ Kind = 'switch' } }
         }
     }
@@ -1797,8 +1797,13 @@ function Invoke-BulkCmdlet {
             $raw = $raw.Trim()
             if ($m.Secret) {
                 $secretText.Add($raw)
-                # The plaintext is already in the CSV file; convert so a SecureString parameter can bind.
-                $b[$k] = if ($elem -eq [securestring]) { ConvertTo-SecureString -String $raw -AsPlainText -Force } else { $raw }
+                # The plaintext is already in the CSV file; a SecureString parameter needs it as one.
+                if ($elem -eq [securestring]) {
+                    $ss = [System.Security.SecureString]::new()
+                    foreach ($ch in $raw.ToCharArray()) { $ss.AppendChar($ch) }
+                    $ss.MakeReadOnly()
+                    $b[$k] = $ss
+                } else { $b[$k] = $raw }
                 continue
             }
             $val = $raw
@@ -1974,7 +1979,7 @@ function Read-OptionMenu {
         }
         if ($k -eq 'back' -or $k -eq '0') { $script:ParamBack   = $true; return $null }
         if ($k -eq 'cancel')              { $script:ParamCancel = $true; return $null }
-        $nums = @($k -split '[,\s]+' | Where-Object { $_ -match '^\d+$' })
+        $nums = @($k -split '[,\s]+' | Where-Object { $_ -match '^\d{1,5}$' })
         if ($nums.Count -eq 0) { Write-Host ('  Type {0} from the list.' -f $hintNums) -ForegroundColor Yellow; continue }
         if (-not $Multi -and $nums.Count -gt 1) { Write-Host '  Just one number for this field.' -ForegroundColor Yellow; continue }
         $sel = @(); $bad = $false
@@ -2115,17 +2120,13 @@ function Read-ParameterValue {
     }
 
     # Otherwise a prompt line with a human-friendly hint.
-    $hint = if ($allowed) {
-        'one or more of: ' + ($allowed -join ', ')
-    } else {
-        switch -Regex ($type.Name) {
-            'Boolean'               { 'true / false' }
-            'Int|Double|Long'       { 'a number' }
-            'DateTime'              { 'a date, e.g. 2026-07-31' }
-            'String\[\]|Object\[\]' { 'one or more values, comma-separated' }
-            'String'                { 'text (e.g. an email address or name)' }
-            default                 { $type.Name }
-        }
+    $hint = switch -Regex ($type.Name) {
+        'Boolean'               { 'true / false'; break }
+        'Int|Double|Long'       { 'a number'; break }
+        'DateTime'              { 'a date, e.g. 2026-07-31'; break }
+        'String\[\]|Object\[\]' { 'one or more values, comma-separated'; break }
+        'String'                { 'text (e.g. an email address or name)'; break }
+        default                 { $type.Name }
     }
     # Directory lookup: offer 'find' when a lookup is registered for this param
     # AND its probe cmdlet is loaded (i.e. we're connected to the right service).
@@ -2136,7 +2137,6 @@ function Read-ParameterValue {
     $hasLast = (@($script:LastResult).Count -gt 0) -and (-not $isArray)
 
     $label = ('Enter -{0} [{1}]{2}' -f $name, $hint, $(if ($Required) { ' (required)' } else { '' }))
-    if ($allowed) { $label += ' - type ? to list options' }
     if ($canFind) { $label += " - or type 'find' to search" }
     if ($hasLast) { $label += " - or 'last' to reuse a value from the last result" }
     $label += " - or 'back' (previous field) / 'cancel' (menu)"
@@ -2147,13 +2147,12 @@ function Read-ParameterValue {
         $key = ("$val").Trim().ToLower()
         if ($key -eq '?') {
             if ($Description) { Write-Host ('  {0}' -f $Description) -ForegroundColor White }
-            if     ($allowed) { Write-Host ('  Options: ' + ($allowed -join ', ')) -ForegroundColor White }
-            elseif ($canFind) { Write-Host "  Enter an email address or name - or type 'find' to search the directory." -ForegroundColor White }
+            if     ($canFind) { Write-Host "  Enter an email address or name - or type 'find' to search the directory." -ForegroundColor White }
             else              { Write-Host '  Free text - type a value.' -ForegroundColor White }
             continue
         }
         # 'back' = re-do the previous field; 'cancel' = abort the whole action.
-        # The caller decides what each means in context (see Build-CommandFromCmdlet).
+        # The caller decides what each means in context (see Invoke-GuidedCmdlet).
         if ($key -eq 'back')   { $script:ParamBack   = $true; return $null }
         if ($key -eq 'cancel') { $script:ParamCancel = $true; return $null }
         if ($key -eq 'find' -and $canFind) {
@@ -2238,7 +2237,7 @@ function Select-ResultColumns {
     Write-Host 'Available columns:' -ForegroundColor White
     for ($i=0; $i -lt $cols.Count; $i++) { Write-Host ('  {0,2}. {1}' -f ($i+1), $cols[$i]) }
     $pick = Read-Host 'Enter column numbers (comma-separated), or Enter for all'
-    $nums = @($pick -split '[,\s]+' | Where-Object { $_ -match '^\d+$' })
+    $nums = @($pick -split '[,\s]+' | Where-Object { $_ -match '^\d{1,5}$' })
     if ($nums.Count -eq 0) { return $cols }
     $sel = foreach ($n in $nums) { $idx=[int]$n-1; if ($idx -ge 0 -and $idx -lt $cols.Count) { $cols[$idx] } }
     @($sel)
@@ -2295,7 +2294,6 @@ function Show-Result {
     # 'last' keyword in Read-ParameterValue). Scalars/strings aren't useful as a
     # pipe source, so only real objects reach here and get stored.
     $script:LastResult = $items
-    $script:LastResultCmdlet = $Cmdlet
     Write-Host "Tip: in the next action, type 'last' at a field to reuse a value from these results." -ForegroundColor White
 
     while ($true) {
@@ -2470,10 +2468,9 @@ function Invoke-Action {
 # ===========================================================================
 function Start-M365Toolkit {
     # Session state for output piping (the 'last' keyword in Read-ParameterValue):
-    # the most recent result set and the cmdlet that produced it. Populated by
+    # the most recent result set. Populated by
     # Show-Result; in-memory only (not persisted across sessions).
     $script:LastResult = @()
-    $script:LastResultCmdlet = $null
     # The undo offer lives for this run only (under 'iex' script scope is the
     # shell's, so a stale undo from an earlier run must not survive).
     $script:LastRevert = $null
@@ -2513,8 +2510,15 @@ function Start-M365Toolkit {
 
         $cfg = Get-ToolkitConfig
         $upnPrompt = if ($cfg.Upn) { "Your email (UPN) [Enter = $($cfg.Upn)]" } else { 'Your email (UPN)' }
-        $upn = Read-Host $upnPrompt
-        if ([string]::IsNullOrWhiteSpace($upn) -and $cfg.Upn) { $upn = $cfg.Upn }
+        $upn = $null
+        while ([string]::IsNullOrWhiteSpace($upn)) {
+            $upn = "$(Read-Host $upnPrompt)".Trim()
+            if (-not $upn -and $cfg.Upn) { $upn = $cfg.Upn }
+            if (-not $upn) {
+                if (Test-InputEnded) { throw [System.IO.EndOfStreamException]::new('No more input (stdin closed).') }
+                Write-Host '  Your email is needed to sign in.' -ForegroundColor Yellow
+            }
+        }
 
         $connected = @{}   # ServiceName -> $true
         $quit = $false
