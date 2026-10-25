@@ -2,6 +2,11 @@
 
 All notable changes to the M365 Guided Command Builder. Newest first.
 
+## v0.32 (2026-10-25)
+- "Run any command" search matches the typed text literally; a `[` no longer ends the tool.
+- A single run skips the cmdlet's own "Are you sure?" after the tool's confirmation (as bulk
+  mode already did), so a declined vendor prompt can't be reported as "Done".
+
 ## v0.31 (2026-10-25)
 - New read-only check "See where a mailbox forwards mail": mailbox forwarding plus inbox rules
   that forward, redirect, delete or hide mail (the usual signs of a taken-over mailbox).

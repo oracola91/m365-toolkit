@@ -230,6 +230,18 @@ Describe 'Sessions and scope' {
         $o = Invoke-Scripted @('not-a-recipient','cancel') { Invoke-GuidedCmdlet -Cmdlet Set-FakeThing -Resolve }
         $o | Should -Match 'No mailbox/user found'
     }
+    It 'matches "Run any command" search text literally (a [ no longer breaks it)' {
+        $cmds = @([pscustomobject]@{ Name = 'Get-Mailbox' }, [pscustomobject]@{ Name = 'Set-Mailbox' })
+        { Find-CommandByText -Commands $cmds -Text '[' } | Should -Not -Throw
+        @(Find-CommandByText -Commands $cmds -Text '[').Count | Should -Be 0
+        @(Find-CommandByText -Commands $cmds -Text 'mailbox').Count | Should -Be 2
+        @(Find-CommandByText -Commands $cmds -Text '*').Count | Should -Be 0
+    }
+    It 'skips the cmdlet''s own confirmation after the typed gate on a single run' {
+        $o = Invoke-Scripted @('mbx1','alice','','Remove-FakePermission') { Invoke-GuidedCmdlet -Cmdlet Remove-FakePermission }
+        $global:Calls.Count | Should -Be 1
+        $o | Should -Match 'own confirmation is skipped'
+    }
     It 'signs out without a prompt' {
         Invoke-Scripted @() { Disconnect-M365Service -Service ([pscustomobject]@{ Name = 'Purview'; Module = 'ExchangeOnlineManagement'; Disconnect = $null }) } | Out-Null
         $global:Calls | Should -Contain 'disconnect confirm=False'
