@@ -16,7 +16,7 @@
       3. $Actions   - plain-language catalogue: friendly label -> cmdlet.
 
 .NOTES
-    v0.24 - 2026-07-14. Engine runs on PowerShell 7+ (Windows/macOS/Linux) and
+    v0.25 - 2026-10-25. Engine runs on PowerShell 7+ (Windows/macOS/Linux) and
     Windows PowerShell 5.1. Per service: Exchange, Purview, Entra, Intune and Teams
     work everywhere; SharePoint (PnP) needs pwsh 7.2+; SharePoint Admin (SPO) and
     Power Platform use Windows-only modules and run on Windows only.
@@ -1275,7 +1275,7 @@ function Invoke-BulkCmdlet {
         $i++
         $splat = & $buildRow $row
         try {
-            & $Cmdlet @splat | Out-Null
+            & $Cmdlet @splat -ErrorAction Stop | Out-Null
             $ok++;  Write-Host ("  [{0}/{1}] OK" -f $i, $rows.Count) -ForegroundColor Green
         } catch {
             $fail++; Write-Host ("  [{0}/{1}] FAILED: {2}" -f $i, $rows.Count, $_.Exception.Message) -ForegroundColor Red
@@ -1806,7 +1806,7 @@ function Start-M365Toolkit {
     Start-Transcript -Path $script:LogFile -Append | Out-Null
     try {
         Write-Host '=====================================================' -ForegroundColor White
-        Write-Host '  Microsoft 365 Guided Command Builder  (v0.24)'       -ForegroundColor White
+        Write-Host '  Microsoft 365 Guided Command Builder  (v0.25)'       -ForegroundColor White
         Write-Host '=====================================================' -ForegroundColor White
 
         $cfg = Get-ToolkitConfig
