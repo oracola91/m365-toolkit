@@ -1,4 +1,4 @@
-# Manual test plan (v0.30)
+# Manual test plan (v0.31)
 
 The engine's logic is covered by the automated tests in `tests/` (run `Invoke-Pester ./tests`,
 and CI runs them on every push). This plan covers what those tests can't: real sign-ins, real
@@ -57,6 +57,18 @@ Exchange and Graph behaviour, and the three platforms. Run it before a release.
   only direct groups (the help says so).
 - [ ] **B10 Shared mailbox access.** "See which shared mailboxes a user can access". Expect: the
   list; if some mailboxes can't be read, a warning with the count.
+- [ ] **B11 Forwarding check.** On a test mailbox, set forwarding and add an inbox rule that
+  forwards, and one that moves mail to "RSS Feeds" and marks it read. Run "See where a mailbox
+  forwards mail". Expect: all three listed (with "keeps NO copy" if no copy is kept); an
+  ordinary rule (e.g. move newsletters to a folder) is not listed.
+- [ ] **B12 Leaver check.** For a test user with Send As, Send on behalf, Full Access on a shared
+  mailbox and a distribution group, run "Leaver check". Expect: each appears under its area.
+  Save it to CSV. If an area can't be read (e.g. missing role), expect a "(could not be read)"
+  row and a warning.
+- [ ] **B13 Nested groups.** For a user in a nested group, run "See ALL groups a user is in".
+  Expect: the nested group listed too (B9 lists only direct ones).
+- [ ] **B14 Reads run once.** Pick any "Check access" action. Expect: no "Run once / Bulk"
+  question.
 
 ## C. Bulk mode
 

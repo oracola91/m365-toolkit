@@ -28,7 +28,7 @@ BeforeAll {
     # Run a block with scripted answers; returns everything it printed as one string.
     function Invoke-Scripted {
         param([string[]] $Answers, [scriptblock] $Block)
-        $global:Answers.Clear(); foreach ($a in $Answers) { $global:Answers.Enqueue($a) }
+        $global:Answers.Clear(); foreach ($ans in $Answers) { $global:Answers.Enqueue($ans) }
         $global:Calls.Clear(); $global:Prompts.Clear()
         $script:Out = @(& $Block 6>&1 3>&1 | ForEach-Object { "$_" })
         ($script:Out -join '')
@@ -268,5 +268,60 @@ Describe 'Local data' {
     It 'reports shared mailboxes the access scan could not read' {
         $o = Invoke-Scripted @() { Get-UserSharedMailboxAccess -User 'alice' }
         $o | Should -Match '1 of 3 shared mailboxes could not be read'
+    }
+}
+
+Describe 'Added checks' {
+    BeforeAll {
+        New-Module -Name ToolkitCheckStubs -ScriptBlock {
+            function Get-Mailbox { [CmdletBinding()] param($Identity, $ResultSize, $RecipientTypeDetails, $Filter)
+                if ($Identity) { return [pscustomobject]@{ Identity = $Identity; ForwardingSmtpAddress = 'smtp:x@evil.test'; ForwardingAddress = $null; DeliverToMailboxAndForward = $false } }
+                if ($Filter) { $global:LastFilter = $Filter; return [pscustomobject]@{ PrimarySmtpAddress = 'boss@contoso.com' } }
+                [pscustomobject]@{ Identity = 'shared1'; PrimarySmtpAddress = 'shared1@contoso.com' } }
+            function Get-InboxRule { [CmdletBinding()] param($Mailbox, [switch] $IncludeHidden)
+                [pscustomobject]@{ Name = 'Forward all'; Enabled = $true; ForwardTo = @('x@evil.test') }
+                [pscustomobject]@{ Name = 'Newsletters'; Enabled = $true; MoveToFolder = 'Newsletters' }
+                [pscustomobject]@{ Name = 'Hide replies'; Enabled = $true; MoveToFolder = 'RSS Feeds'; MarkAsRead = $true } }
+            function Get-Recipient { [CmdletBinding()] param($Identity, $ResultSize, $Filter)
+                if ($Identity) { return [pscustomobject]@{ DistinguishedName = "CN=O'Brien,OU=contoso"; PrimarySmtpAddress = 'obrien@contoso.com' } }
+                [pscustomobject]@{ PrimarySmtpAddress = 'sales@contoso.com'; RecipientTypeDetails = 'MailUniversalDistributionGroup' } }
+            function Get-RecipientPermission { [CmdletBinding()] param($Trustee, $ResultSize) throw 'access denied' }
+            function Get-MailboxPermission { [CmdletBinding()] param($Identity, $User)
+                if ($User) { return [pscustomobject]@{ AccessRights = @('FullAccess'); IsInherited = $false } }
+                [pscustomobject]@{ User = 'NT AUTHORITY\SELF'; AccessRights = @('FullAccess'); IsInherited = $false }
+                [pscustomobject]@{ User = 'helpdesk@contoso.com'; AccessRights = @('FullAccess'); IsInherited = $false } }
+            Export-ModuleMember -Function *
+        } | Import-Module -DisableNameChecking -Force
+    }
+    AfterAll { Remove-Module ToolkitCheckStubs -ErrorAction SilentlyContinue; Remove-Variable LastFilter -Scope Global -ErrorAction SilentlyContinue }
+
+    It 'forwarding check lists mailbox forwarding and suspicious rules, not ordinary ones' {
+        $r = @(Get-MailboxForwardingReport -Identity 'm1')
+        $r.Count | Should -Be 3
+        $r[0].WhatItDoes | Should -Match 'keeps NO copy'
+        ($r | Where-Object Name -eq 'Hide replies').WhatItDoes | Should -Match 'moves to RSS Feeds, marks as read'
+        $r.Name | Should -Not -Contain 'Newsletters'
+    }
+    It 'leaver check covers every area, lists the unreadable one, and escapes the DN' {
+        $o = @(Get-UserAccessReport -User 'obrien' -WarningVariable w -WarningAction SilentlyContinue)
+        ($o | Where-Object Area -eq 'Send As').Object | Should -Be '(could not be read)'
+        ($o | Where-Object Area -eq 'Send on behalf').Object | Should -Be 'boss@contoso.com'
+        ($o | Where-Object Area -eq 'Mail groups').Object | Should -Be 'sales@contoso.com'
+        ($o | Where-Object Area -eq 'Own mailbox: who can open it').Object | Should -Be 'helpdesk@contoso.com'
+        @($o | Where-Object Area -eq 'Own mailbox: forwarding and rules').Count | Should -Be 3
+        $global:LastFilter | Should -Match "O''Brien"
+        "$w" | Should -Match 'Could not fully read: Send As'
+    }
+    It 'transitive group action shares the membership projection' {
+        $t = $Actions | Where-Object Id -eq 'user-groups-transitive'
+        $t.Cmdlet | Should -Be 'Get-MgUserTransitiveMemberOf'
+        $row = & $t.Project @([pscustomobject]@{ AdditionalProperties = @{ '@odata.type' = '#microsoft.graph.group'; groupTypes = @('Unified'); displayName = 'Team A'; mail = 'a@contoso.com' } })
+        $row.Type | Should -Be 'Microsoft 365 group'
+    }
+    It 'read actions run once without the bulk question' {
+        $act = $Actions | Where-Object Id -eq 'mbx-check-forwarding'
+        $o = Invoke-Scripted @('mbx1','y','5','3') { Invoke-Action -Action $act }
+        $o | Should -Not -Match 'How do you want to run'
+        $o | Should -Match 'Returned 3 item'
     }
 }

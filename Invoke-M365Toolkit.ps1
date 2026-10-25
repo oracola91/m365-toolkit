@@ -17,7 +17,7 @@
       3. $Actions   - plain-language catalogue: friendly label -> cmdlet.
 
 .NOTES
-    v0.30 - 2026-10-25. Engine runs on PowerShell 7+ (Windows/macOS/Linux) and
+    v0.31 - 2026-10-25. Engine runs on PowerShell 7+ (Windows/macOS/Linux) and
     Windows PowerShell 5.1. Per service: Exchange, Purview, Entra, Intune and Teams
     work everywhere; SharePoint (PnP) needs pwsh 7.2+; SharePoint Admin (SPO) and
     Power Platform use Windows-only modules and run on Windows only.
@@ -41,7 +41,7 @@ param(
 # is the caller's own shell, which gets its setting back when the tool exits.
 $script:CallerErrorActionPreference = $ErrorActionPreference
 $ErrorActionPreference = 'Stop'
-$script:ToolkitVersion = 'v0.30'
+$script:ToolkitVersion = 'v0.31'
 
 # Where logs and CSV exports go. Prefer the script's own folder, but when the
 # tool is run remotely (irm <URL> | iex) there is no script file on disk, so
@@ -169,6 +169,82 @@ function Get-UserSharedMailboxAccess {
     if ($failed -gt 0) { Write-Warning ('{0} of {1} shared mailboxes could not be read - this list may be incomplete.' -f $failed, $shared.Count) }
 }
 
+# Where a mailbox's mail goes besides its inbox: mailbox forwarding, and inbox
+# rules that forward, redirect, delete, or move mail somewhere easy to miss (the
+# usual steps after an account takeover). Read-only. Nothing returned = none found.
+function Get-MailboxForwardingReport {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [string] $Identity)
+    $mbx = Get-Mailbox -Identity $Identity -ErrorAction Stop
+    $fwd = @(@($mbx.ForwardingSmtpAddress, $mbx.ForwardingAddress) | Where-Object { $_ })
+    if ($fwd.Count -gt 0) {
+        [pscustomobject]@{
+            Source = 'Mailbox setting'; Name = 'Forwarding'; Enabled = $true
+            WhatItDoes = 'forwards all mail' + $(if ($mbx.DeliverToMailboxAndForward) { ' (keeps a copy)' } else { ' (keeps NO copy)' })
+            Target = (@($fwd | ForEach-Object { "$_" }) -join '; ')
+        }
+    }
+    $ruleArgs = @{ Mailbox = $Identity; ErrorAction = 'Stop' }
+    if ((Get-Command Get-InboxRule).Parameters.ContainsKey('IncludeHidden')) { $ruleArgs.IncludeHidden = $true }
+    foreach ($r in @(Get-InboxRule @ruleArgs)) {
+        $to   = @(@($r.ForwardTo) + @($r.ForwardAsAttachmentTo) + @($r.RedirectTo) | Where-Object { $_ })
+        $what = @()
+        if ($to.Count -gt 0)                                   { $what += 'forwards or redirects' }
+        if ($r.DeleteMessage -or $r.SoftDeleteMessage)         { $what += 'deletes' }
+        if ("$($r.MoveToFolder)" -match '(?i)RSS|Conversation History|Junk|Deleted Items') { $what += ('moves to ' + $r.MoveToFolder) }
+        if ($what.Count -eq 0) { continue }
+        if ($r.MarkAsRead) { $what += 'marks as read' }
+        [pscustomobject]@{
+            Source = 'Inbox rule'; Name = [string]$r.Name; Enabled = [bool]$r.Enabled
+            WhatItDoes = ($what -join ', ')
+            Target = (@($to | ForEach-Object { "$_" }) -join '; ')
+        }
+    }
+}
+
+# Leaver check: everything a user can still reach through Exchange, in one list,
+# for offboarding evidence. An area that could not be read gets its own row and a
+# warning - never a silent gap, which would read as "no access". Not covered:
+# calendar delegations on other mailboxes, Full Access on user (non-shared)
+# mailboxes, and Entra roles or app access.
+function Get-UserAccessReport {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [string] $User)
+    $rcpt   = Get-Recipient -Identity $User -ErrorAction Stop | Select-Object -First 1
+    $dnEsc  = "$($rcpt.DistinguishedName)".Replace("'", "''")   # quotes doubled for the OPATH filters
+    $failed = [System.Collections.Generic.List[string]]::new()
+    $row = { param($area, $object, $access, $detail) [pscustomobject]@{ Area = $area; Object = [string]$object; Access = [string]$access; Detail = [string]$detail } }
+    $areas = [ordered]@{
+        'Send As' = {
+            Get-RecipientPermission -Trustee $User -ResultSize Unlimited -ErrorAction Stop |
+                Where-Object { $_.AccessRights -contains 'SendAs' -and -not $_.IsInherited } |
+                ForEach-Object { & $row 'Send As' $_.Identity 'SendAs' '' } }
+        'Send on behalf' = {
+            Get-Mailbox -ResultSize Unlimited -Filter "GrantSendOnBehalfTo -eq '$dnEsc'" -ErrorAction Stop |
+                ForEach-Object { & $row 'Send on behalf' $_.PrimarySmtpAddress 'SendOnBehalf' '' } }
+        'Full Access (shared mailboxes)' = {
+            $w = $null
+            Get-UserSharedMailboxAccess -User $User -WarningVariable w -WarningAction SilentlyContinue |
+                ForEach-Object { & $row 'Full Access (shared mailboxes)' $_.PrimarySmtpAddress 'FullAccess' '' }
+            if (@($w).Count -gt 0) { $failed.Add('Full Access (shared mailboxes), partly'); & $row 'Full Access (shared mailboxes)' '(partly read)' '' ((@($w) | ForEach-Object { "$_" }) -join ' ') } }
+        'Mail groups' = {
+            Get-Recipient -ResultSize Unlimited -Filter "Members -eq '$dnEsc'" -ErrorAction Stop |
+                ForEach-Object { & $row 'Mail groups' $_.PrimarySmtpAddress 'Member' $_.RecipientTypeDetails } }
+        'Own mailbox: forwarding and rules' = {
+            Get-MailboxForwardingReport -Identity $User |
+                ForEach-Object { & $row 'Own mailbox: forwarding and rules' $_.Name $_.WhatItDoes $_.Target } }
+        'Own mailbox: who can open it' = {
+            Get-MailboxPermission -Identity $User -ErrorAction Stop |
+                Where-Object { -not $_.IsInherited -and "$($_.User)" -notmatch 'NT AUTHORITY\\SELF' } |
+                ForEach-Object { & $row 'Own mailbox: who can open it' $_.User (@($_.AccessRights) -join ', ') '' } }
+    }
+    foreach ($a in $areas.Keys) {
+        try   { & $areas[$a] }
+        catch { $failed.Add($a); & $row $a '(could not be read)' '' $_.Exception.Message }
+    }
+    if ($failed.Count -gt 0) { Write-Warning ('Could not fully read: {0}. The report is incomplete there.' -f ($failed -join '; ')) }
+}
+
 # The calendar folder of a mailbox as "<mailbox>:\<folder>". The folder name is
 # localized (e.g. "Kalender"), so read it from the mailbox; fall back to
 # "Calendar" when it can't be read.
@@ -232,6 +308,36 @@ $calendarUserCandidates = { param($bound)
                 Value   = $addr
             }
         } | Where-Object { $_.Value }
+}
+
+# Flatten Graph membership results (Get-MgUserMemberOf, Get-MgUserTransitiveMemberOf).
+# The useful fields sit in an AdditionalProperties bag, so each becomes a clean
+# Name / Email / Type row that says WHAT the group is.
+$graphGroupProjection = {
+    param($r)
+    @($r) | ForEach-Object {
+        $ap = $_.AdditionalProperties; if (-not $ap) { $ap = @{} }
+        $odata = [string]$ap['@odata.type']
+        $type =
+            if     ($odata -match 'directoryRole') { 'Directory role' }
+            elseif ($odata -match 'group' -or $ap.ContainsKey('groupTypes')) {
+                $gt   = @($ap['groupTypes'])
+                $mail = [bool]$ap['mailEnabled']
+                $sec  = [bool]$ap['securityEnabled']
+                if     ($gt -contains 'Unified') { 'Microsoft 365 group' }
+                elseif ($mail -and $sec)         { 'Mail-enabled security' }
+                elseif ($mail)                   { 'Distribution group' }
+                elseif ($sec)                    { 'Security group' }
+                else                             { 'Group' }
+            }
+            elseif ($odata) { $odata -replace '#microsoft\.graph\.','' }
+            else            { 'Object' }
+        [pscustomobject]@{
+            Name  = [string]$ap['displayName']
+            Email = [string]$ap['mail']
+            Type  = $type
+        }
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -358,6 +464,20 @@ $Actions = @(
         }
     }
     [pscustomobject]@{
+        Id='mbx-check-forwarding'; Service='Exchange Online'; Category='Check access'
+        Label='See where a mailbox forwards mail (forwarding and inbox rules)'
+        Cmdlet='Get-MailboxForwardingReport'; Prompt=@('Identity')
+        Help='Read-only. Shows mailbox forwarding and inbox rules that forward, redirect, delete or hide mail: the usual signs of a taken-over mailbox. An empty result means none were found.'
+        ParamHelp=@{ Identity='The mailbox to check (email or name; find / last work).' }
+    }
+    [pscustomobject]@{
+        Id='user-leaver-check'; Service='Exchange Online'; Category='Check access'
+        Label='Leaver check: what a user can still access (Exchange)'
+        Cmdlet='Get-UserAccessReport'; Prompt=@('User')
+        Help='Read-only, for offboarding evidence: Send As, Send on behalf, Full Access on shared mailboxes, mail group memberships, forwarding and rules on their own mailbox, and who can open it. Areas that could not be read are listed, never skipped. Not covered: calendar delegations on other mailboxes, Full Access on user mailboxes, Entra roles and apps. Save the result to CSV as evidence.'
+        ParamHelp=@{ User='The person who is leaving (email or name; find / last work).' }
+    }
+    [pscustomobject]@{
         Id='cal-check-access'; Service='Exchange Online'; Category='Check access'
         Label='See who has access to a calendar'
         Cmdlet='Get-MailboxFolderPermission'; Prompt=@('Identity')
@@ -462,35 +582,16 @@ $Actions = @(
         Preset=@{ All=$true }
         Help='List the groups (and directory roles) a user is a DIRECT member of, each labelled with what it is - Distribution group, Microsoft 365 group, Security group, Mail-enabled security, or Directory role. Groups reached through nesting are not included.'
         ParamHelp=@{ UserId='The user whose memberships you want (email or object id). Type find to search the directory, or last to reuse someone from a previous result.' }
-        # Get-MgUserMemberOf returns raw directory objects whose useful fields sit
-        # in an AdditionalProperties bag. Flatten to clean Name / Email / Type so
-        # the table is readable (and so the Type says WHAT each group is).
-        Project={
-            param($r)
-            @($r) | ForEach-Object {
-                $ap = $_.AdditionalProperties; if (-not $ap) { $ap = @{} }
-                $odata = [string]$ap['@odata.type']
-                $type =
-                    if     ($odata -match 'directoryRole') { 'Directory role' }
-                    elseif ($odata -match 'group' -or $ap.ContainsKey('groupTypes')) {
-                        $gt   = @($ap['groupTypes'])
-                        $mail = [bool]$ap['mailEnabled']
-                        $sec  = [bool]$ap['securityEnabled']
-                        if     ($gt -contains 'Unified') { 'Microsoft 365 group' }
-                        elseif ($mail -and $sec)         { 'Mail-enabled security' }
-                        elseif ($mail)                   { 'Distribution group' }
-                        elseif ($sec)                    { 'Security group' }
-                        else                             { 'Group' }
-                    }
-                    elseif ($odata) { $odata -replace '#microsoft\.graph\.','' }
-                    else            { 'Object' }
-                [pscustomobject]@{
-                    Name  = [string]$ap['displayName']
-                    Email = [string]$ap['mail']
-                    Type  = $type
-                }
-            }
-        }
+        Project=$graphGroupProjection
+    }
+    [pscustomobject]@{
+        Id='user-groups-transitive'; Service='Entra / Identity (Graph)'; Category='Check access'
+        Label='See ALL groups a user is in, including nested groups'
+        Cmdlet='Get-MgUserTransitiveMemberOf'; Prompt=@('UserId')
+        Preset=@{ All=$true }
+        Help='List every group and directory role a user belongs to, directly or through nested groups, each labelled with what it is. Use this for access reviews; "See which groups a user is in" lists direct memberships only.'
+        ParamHelp=@{ UserId='The user whose memberships you want (email or object id). Type find to search the directory, or last to reuse someone from a previous result.' }
+        Project=$graphGroupProjection
     }
     [pscustomobject]@{
         Id='spo-list-sites'; Service='SharePoint Admin (SPO)'; Category='Sites'; Label='List all SharePoint sites'
@@ -2447,8 +2548,12 @@ function Get-NextStep {
 # ---------------------------------------------------------------------------
 function Invoke-Action {
     param([Parameter(Mandatory)] $Action)
-    $mode = Get-MenuChoice -Title "How do you want to run '$($Action.Label)'?" `
-                -Options @('Run once (type the values now)','Bulk - run for every row in a CSV file') -AllowBack
+    # A read (Get-*) runs once: bulk mode discards each row's output, so a bulk
+    # "check" would show nothing.
+    $mode = if ($Action.Cmdlet -like 'Get-*') { 'Run once' } else {
+        Get-MenuChoice -Title "How do you want to run '$($Action.Label)'?" `
+            -Options @('Run once (type the values now)','Bulk - run for every row in a CSV file') -AllowBack
+    }
     if (-not $mode) { return 'again' }
     # Same guard as the run-any path: an unexpected error reports and returns to
     # the menu instead of ending the session (and losing the in-memory undo).
