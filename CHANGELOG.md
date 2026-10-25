@@ -2,6 +2,15 @@
 
 All notable changes to the M365 Guided Command Builder. Newest first.
 
+## v0.31 (2026-10-25)
+- New read-only check "See where a mailbox forwards mail": mailbox forwarding plus inbox rules
+  that forward, redirect, delete or hide mail (the usual signs of a taken-over mailbox).
+- New "Leaver check": Send As, Send on behalf, Full Access on shared mailboxes, mail groups,
+  forwarding and rules on the user's own mailbox, and who can open it, in one list for
+  offboarding evidence. Areas that can't be read are listed, never skipped.
+- New "See ALL groups a user is in, including nested groups" (Graph, transitive membership).
+- Catalogued read actions run once; bulk mode is offered only for actions that change things.
+
 ## v0.30 (2026-10-25)
 - Automated tests (`tests/`, Pester 5) and CI on GitHub Actions: PSScriptAnalyzer, and the
   tests on PowerShell 7 (Linux and Windows) and Windows PowerShell 5.1.

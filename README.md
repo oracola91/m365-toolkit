@@ -117,10 +117,12 @@ If a required module isn't installed, the tool offers to install it for the curr
 Catalogued actions cover the common jobs, grouped by category:
 
 - **Exchange Online.** Check access (who has access to a mailbox or calendar, who can Send As,
-  which mail groups or shared mailboxes a user has, who is in a distribution group); Give access
+  which mail groups or shared mailboxes a user has, who is in a distribution group, where a
+  mailbox forwards mail, and a leaver check of everything a user can still access); Give access
   (mailbox, Send As, calendar, distribution group); Remove and change access (mailbox and
   calendar); Mailboxes (look up, change a setting, create or convert shared mailboxes).
-- **Entra / Identity (Graph).** Look up a user; see which groups a user is directly in.
+- **Entra / Identity (Graph).** Look up a user; see which groups a user is directly in, or all
+  groups including nested ones.
 - **SharePoint Admin (SPO).** List all sites. **Intune / Devices (Graph).** List enrolled
   devices. **Power Platform (admin).** List environments.
 
@@ -129,8 +131,8 @@ Catalogued actions cover the common jobs, grouped by category:
 and the engine guides its parameters exactly the same way. So the tool is not limited to
 the catalogued actions — it can drive *any* cmdlet the connected module exposes.
 
-**Run once or in bulk:** after choosing an action (or a run-any cmdlet) you pick
-**Run once** (type the values now) or **Bulk from a CSV file** (run it for every row;
+**Run once or in bulk:** after choosing an action that changes something (or a run-any
+cmdlet) you pick **Run once** (type the values now) or **Bulk from a CSV file** (run it for every row;
 UTF-8 or Excel's ANSI encoding, `,` or `;` separated).
 
 **Results / export:** when a command returns objects (e.g. a lookup), the tool offers to
