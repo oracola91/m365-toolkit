@@ -64,7 +64,13 @@ cd M365Toolkit
 .\Invoke-M365Toolkit.ps1 -DryRunOnly
 # Normal run (asks y/n before running each command)
 .\Invoke-M365Toolkit.ps1
+# Only if the browser sign-in for Entra / Intune hangs (seen on macOS): device code instead
+.\Invoke-M365Toolkit.ps1 -UseDeviceCode
 ```
+
+After each sign-in the tool shows the account the session is really signed in as, and
+stops if it differs from the email you typed. On Quit it signs out of every service it
+connected to.
 
 ### Run it remotely (once the repo is public)
 
