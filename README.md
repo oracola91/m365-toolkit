@@ -66,6 +66,8 @@ cd M365Toolkit
 .\Invoke-M365Toolkit.ps1
 # Only if the browser sign-in for Entra / Intune hangs (seen on macOS): device code instead
 .\Invoke-M365Toolkit.ps1 -UseDeviceCode
+# Also keep a full screen transcript of the session (off by default: it holds every result you view)
+.\Invoke-M365Toolkit.ps1 -Transcript
 ```
 
 After each sign-in the tool shows the account the session is really signed in as, and
@@ -100,7 +102,12 @@ If a required module isn't installed, the tool offers to install it for the curr
 
 - Uses **your signed-in admin's RBAC role** — a helpdesk member can only do what their
   role permits.
-- Every session is transcript-logged to `.\logs\session-<timestamp>.log` for audit.
+- Every action (sign-in and sign-out, each command, each bulk row, each undo) is recorded in
+  `logs\actions-<timestamp>.jsonl`: who, which service and tenant, the command, its target and
+  the outcome. Other values are not kept: the Microsoft 365 unified audit log is the full record
+  of changes, and this local file is not an audit trail. A full screen transcript
+  (`logs\session-<timestamp>.log`) is written only with `-Transcript`. Logs and the tool's own
+  exports are owner-only and deleted after 30 days.
 - At any parameter prompt, type **`?`** to list the allowed values. In the category and
   action menus, type **`?`** for a short explanation of each choice.
 
