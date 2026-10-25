@@ -32,13 +32,24 @@ jobs:
           - { os: ubuntu-latest,  shell: pwsh }
           - { os: windows-latest, shell: pwsh }
           - { os: windows-latest, shell: powershell }
+    name: test (${{ matrix.shell }}, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
-      - name: Pester (${{ matrix.shell }} on ${{ matrix.os }})
-        shell: ${{ matrix.shell }}
+      # The step shell can't come from the matrix, so one step per shell.
+      - name: Pester on PowerShell 7
+        if: matrix.shell == 'pwsh'
+        shell: pwsh
+        run: |
+          Install-Module Pester -RequiredVersion 5.7.1 -Repository PSGallery -Scope CurrentUser -Force -SkipPublisherCheck
+          Import-Module Pester -RequiredVersion 5.7.1
+          $r = Invoke-Pester ./tests -Output Detailed -PassThru
+          if ($r.FailedCount -gt 0 -or $r.Result -ne 'Passed') { exit 1 }
+      - name: Pester on Windows PowerShell 5.1
+        if: matrix.shell == 'powershell'
+        shell: powershell
         run: |
           Install-Module Pester -RequiredVersion 5.7.1 -Repository PSGallery -Scope CurrentUser -Force -SkipPublisherCheck
           Import-Module Pester -RequiredVersion 5.7.1
