@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="919" height="879" viewBox="0 0 919 879" role="img" aria-label="Invoke-M365Toolkit.ps1 -DryRunOnly  -  guided parameters and preview">
+<title>Invoke-M365Toolkit.ps1 -DryRunOnly  -  guided parameters and preview</title>
+<rect x="0.5" y="0.5" width="918" height="878" rx="10" fill="#0d1117" stroke="#30363d"/>
+<path d="M0.5 34 V10.5 a10 10 0 0 1 10 -10 H908.5 a10 10 0 0 1 10 10 V34 Z" fill="#161b22" stroke="#30363d"/>
+<circle cx="20" cy="17.5" r="6" fill="#ff5f57"/>
+<circle cx="40" cy="17.5" r="6" fill="#febc2e"/>
+<circle cx="60" cy="17.5" r="6" fill="#28c840"/>
+<text x="459.5" y="22.0" text-anchor="middle" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#8b949e">Invoke-M365Toolkit.ps1 -DryRunOnly  -  guided parameters and preview</text>
+<g font-family="JetBrains Mono,Cascadia Mono,SFMono-Regular,Menlo,Consolas,DejaVu Sans Mono,Liberation Mono,monospace" font-size="13" xml:space="preserve">
+<text x="18" y="62"><tspan fill="#f0f6fc">Building: Add-MailboxPermission</tspan></text>
+<text x="18" y="81"><tspan fill="#f0f6fc">  Grant ONE person the right to open/manage ANOTHER mailbox (a colleague&#x27;s or a shared mailbox). For a shared ma</tspan></text>
+<text x="18" y="100"><tspan fill="#f0f6fc">ilbox pick FullAccess; to control whether it auto-appears in their Outlook, set the optional AutoMapping paramet</tspan></text>
+<text x="18" y="119"><tspan fill="#f0f6fc">er.</tspan></text>
+<text x="18" y="138"><tspan fill="#f0f6fc">  1 required, 5 optional, 1 switches</tspan></text>
+<text x="18" y="157"><tspan fill="#f0f6fc">  -&gt; The mailbox that will BE accessed - whose inbox is opened (e.g. a shared mailbox, or a colleague)</tspan></text>
+<text x="18" y="176"><tspan fill="#c9d1d9">Enter -Identity [text (e.g. an email address or name)] (required) - or type &#x27;find&#x27; to search - or &#x27;back&#x27; (previo</tspan></text>
+<text x="18" y="195"><tspan fill="#c9d1d9">us field) / &#x27;cancel&#x27; (menu): </tspan><tspan fill="#56d4dd">support@contoso.com</tspan></text>
+<text x="18" y="214"><tspan fill="#f0f6fc">  -&gt; The person who will GET the access</tspan></text>
+<text x="18" y="233"><tspan fill="#c9d1d9">Enter -User [text (e.g. an email address or name)] - or type &#x27;find&#x27; to search - or &#x27;back&#x27; (previous field) / &#x27;ca</tspan></text>
+<text x="18" y="252"><tspan fill="#c9d1d9">ncel&#x27; (menu): </tspan><tspan fill="#56d4dd">jordan@contoso.com</tspan></text>
+<text x="18" y="271"><tspan fill="#f0f6fc">  -&gt; What they may do. FullAccess = open &amp; manage everything (Send As is a separate action)</tspan></text>
+<text x="18" y="309"><tspan fill="#f0f6fc">Choose one or more for -AccessRights:</tspan></text>
+<text x="18" y="328"><tspan fill="#c9d1d9">   1. FullAccess</tspan></text>
+<text x="18" y="347"><tspan fill="#c9d1d9">   2. ExternalAccount</tspan></text>
+<text x="18" y="366"><tspan fill="#c9d1d9">   3. DeleteItem</tspan></text>
+<text x="18" y="385"><tspan fill="#c9d1d9">   4. ReadPermission</tspan></text>
+<text x="18" y="404"><tspan fill="#c9d1d9">   5. ChangePermission</tspan></text>
+<text x="18" y="423"><tspan fill="#c9d1d9">   6. ChangeOwner</tspan></text>
+<text x="18" y="442"><tspan fill="#f0f6fc">   0. Back to previous field   (or type &#x27;cancel&#x27; to quit to the menu)</tspan></text>
+<text x="18" y="461"><tspan fill="#c9d1d9">Enter numbers (e.g. 1,3), 0 to go back, or ? to explain: </tspan><tspan fill="#56d4dd">1</tspan></text>
+<text x="18" y="480"><tspan fill="#f0f6fc">  -&gt; FullAccess</tspan></text>
+<text x="18" y="518"><tspan fill="#f0f6fc">Optional parameters you can set:</tspan></text>
+<text x="18" y="537"><tspan fill="#c9d1d9">   1. AutoMapping  (Boolean)</tspan></text>
+<text x="18" y="556"><tspan fill="#c9d1d9">   2. InheritanceType  (String)</tspan></text>
+<text x="18" y="575"><tspan fill="#c9d1d9">   3. Owner  (String)</tspan></text>
+<text x="18" y="594"><tspan fill="#f0f6fc">   (type ? to explain each one)</tspan></text>
+<text x="18" y="613"><tspan fill="#c9d1d9">Enter numbers to set (comma-separated), ? to explain, or Enter to skip: </tspan><tspan fill="#56d4dd">1</tspan></text>
+<text x="18" y="632"><tspan fill="#f0f6fc">  -&gt; Only meaningful with FullAccess. true = the mailbox appears automatically in the person&#x27;s Outlook; false = </tspan></text>
+<text x="18" y="651"><tspan fill="#f0f6fc">they add it manually (often preferred for large shared mailboxes)</tspan></text>
+<text x="18" y="670"><tspan fill="#c9d1d9">Enter -AutoMapping [true / false] - or &#x27;back&#x27; (previous field) / &#x27;cancel&#x27; (menu): </tspan><tspan fill="#56d4dd">no</tspan></text>
+<text x="18" y="708"><tspan fill="#f0f6fc">Switches you can enable:</tspan></text>
+<text x="18" y="727"><tspan fill="#c9d1d9">   1. Deny</tspan></text>
+<text x="18" y="746"><tspan fill="#f0f6fc">   (type ? to explain each one)</tspan></text>
+<text x="18" y="765"><tspan fill="#c9d1d9">Enter numbers to enable (comma-separated), ? to explain, or Enter to skip: </tspan></text>
+<text x="18" y="803"><tspan fill="#e3b341">Preview (dry-run):</tspan></text>
+<text x="18" y="822"><tspan fill="#c9d1d9">  </tspan><tspan fill="#56d4dd">Add-MailboxPermission</tspan><tspan fill="#e3b341"> -Identity</tspan><tspan fill="#f0f6fc"> &#x27;support@contoso.com&#x27;</tspan><tspan fill="#e3b341"> -User</tspan><tspan fill="#f0f6fc"> &#x27;jordan@contoso.com&#x27;</tspan><tspan fill="#e3b341"> -AccessRights</tspan><tspan fill="#f0f6fc"> &#x27;FullAccess&#x27;</tspan><tspan fill="#e3b341"> -A</tspan></text>
+<text x="18" y="841"><tspan fill="#e3b341">utoMapping</tspan><tspan fill="#f0f6fc"> $false</tspan></text>
+<text x="18" y="860"><tspan fill="#f0f6fc">DryRunOnly is set - not executing.</tspan></text>
+</g></svg>
