@@ -1,3 +1,23 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/banner-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="docs/images/banner-light.svg">
+    <img alt="M365 Guided Command Builder. Pick a task in plain words, get the exact cmdlet and a dry-run preview. Nothing runs until you confirm." src="docs/images/banner-light.svg" width="100%">
+  </picture>
+</p>
+
+<p align="center">
+  <b>Run Microsoft 365 admin tasks from plain-language menus. No cmdlet names to remember.</b>
+</p>
+
+<p align="center">
+  <a href="https://github.com/oracola91/m365-toolkit/actions/workflows/ci.yml"><img alt="CI status" src="https://img.shields.io/github/actions/workflow/status/oracola91/m365-toolkit/ci.yml?branch=main&label=CI"></a>
+  <img alt="PowerShell 5.1 and 7+" src="https://img.shields.io/badge/PowerShell-5.1%20%7C%207%2B-5391FE?logo=powershell&logoColor=white">
+  <img alt="Runs on Windows, macOS and Linux" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-informational">
+  <a href="tests/"><img alt="Tests: Pester 5" src="https://img.shields.io/badge/tests-Pester%205-brightgreen"></a>
+  <a href="SECURITY.md"><img alt="Security policy" src="https://img.shields.io/badge/security-policy-blue"></a>
+</p>
+
 # M365 Guided Command Builder
 
 A plain-language, menu-driven PowerShell tool so the IT team can run Microsoft 365
@@ -5,149 +25,164 @@ admin commands **without memorizing cmdlet names or syntax**. You pick an action
 human language and the tool walks you through the parameters one at a time, shows you
 the exact command it will run (dry-run), and only runs it when you confirm.
 
-## How it works (independent layers, each extended by adding one row)
+## What it does
 
-1. **Connection registry** (`$Services`) — one row per M365 service. On launch you
-   enter your email and choose which service to connect to (Exchange Online, Entra/Graph,
-   SharePoint/PnP, Teams, Security & Compliance, SharePoint Admin/SPO, Intune/Devices,
-   Power Platform). Add a service = add one row.
-2. **Introspection engine** (`Invoke-GuidedCmdlet` / `Get-CmdletParameters`) — the clever
-   bit. It reads the *real* parameters straight off the cmdlet with
-   `(Get-Command X).Parameters`, so it's always accurate and never goes stale. It sorts
-   them into **Required → Optional → Switches**, and for each one it works out the allowed
-   values from a `[ValidateSet]`, an **enum type**, or the manual `$ParamHints` table, then
-   offers them as a numbered pick or lists them inline (type `?` at any prompt to see them).
-   Works for *any* cmdlet in *any* connected module — no per-command code.
-3. **Plain-language catalogue** (`$Actions`) — the only per-command work: a friendly
-   `Label → Cmdlet` mapping, grouped by category, with optional `Help`, per-parameter
-   `ParamHelp` (who → whom), and `Preset` values the action fixes for you. Add an
-   action = add one row.
-4. **Bulk runner** (`Invoke-BulkCmdlet`) — run the *same* action once per row of a CSV.
-   You map each parameter to a CSV column or a fixed value. Every row is checked before
-   anything runs (same value rules as a single run; identity columns are looked up for
-   catalogued actions), blank cells are skipped unless you choose to clear, and the
-   targets are listed. Destructive commands need the command name and the row count
-   typed. Each row's outcome (and, for a `Set-*`, the values it replaced) is saved to
-   `exports\bulk-<cmdlet>-<timestamp>-results.csv`.
+- **Plain-language menus.** Pick a service, then a task such as "Give a user access to
+  another mailbox". You never type a cmdlet name unless you want to.
+- **Guided parameters.** It reads the real parameters off the cmdlet, asks for them one at a
+  time, offers the allowed values as a numbered list, and can search the directory for a person.
+- **Preview, then confirm.** It shows the exact command first. Nothing runs until you say
+  yes, and destructive changes need the command name typed.
 
-## Requirements / platform support
+## Screenshots
 
-The tool itself is plain PowerShell and runs on **PowerShell 7+ (Windows, macOS, Linux)**
-and **Windows PowerShell 5.1**. It only loads a service's module when you pick that
-service, so unsupported services fail with a clear message rather than crashing the tool.
+<table>
+  <tr>
+    <td width="33%" valign="top"><a href="docs/images/screen-menus.svg"><img src="docs/images/screen-menus.svg" alt="Start screen: pick a service, a category and an action from numbered plain-language menus"></a></td>
+    <td width="33%" valign="top"><a href="docs/images/screen-builder.svg"><img src="docs/images/screen-builder.svg" alt="Guided builder: the tool asks for each parameter, offers allowed values and shows the exact command as a dry-run preview"></a></td>
+    <td width="33%" valign="top"><a href="docs/images/screen-safety.svg"><img src="docs/images/screen-safety.svg" alt="Safety gate: a destructive command needs the cmdlet name typed, anything else cancels"></a></td>
+  </tr>
+  <tr>
+    <td align="center"><b>1. Pick a task</b><br>Services, categories and actions in plain words.</td>
+    <td align="center"><b>2. Answer the prompts</b><br>Allowed values listed, then a dry-run preview.</td>
+    <td align="center"><b>3. Confirm on purpose</b><br>Destructive changes need the name typed.</td>
+  </tr>
+</table>
 
-Coverage depends on the vendor module behind each service — and two of Microsoft's
-modules are **Windows-only** (built on .NET Framework, which macOS/Linux don't have):
+<sub>Captured from the real script, with sign-in replaced by a stub and fictional
+<code>contoso.com</code> data. No tenant was used. Click an image to see it full size.</sub>
 
-| Service | macOS / Linux (pwsh 7) | Windows (pwsh 7) | Windows PowerShell 5.1 |
-|---|:--:|:--:|:--:|
-| Exchange Online | ✅ | ✅ | ✅ |
-| Security & Compliance (Purview) | ✅ | ✅ | ✅ |
-| Entra / Identity (Graph) | ✅ | ✅ | ✅ |
-| Intune / Devices (Graph) | ✅ | ✅ | ✅ |
-| Microsoft Teams | ✅ | ✅ | ✅ |
-| SharePoint Online (PnP) | ✅ | ✅ | ❌ (PnP needs pwsh 7.2+) |
-| **SharePoint Admin (SPO)** | ❌ Windows only | ✅ | ✅ |
-| **Power Platform (admin)** | ❌ Windows only | ✅ | ✅ |
+## Features
 
-> The two Windows-only services (**SharePoint Admin**, **Power Platform**) are a Microsoft
-> platform limitation, not a bug in this tool — Microsoft doesn't ship those modules for
-> macOS/Linux. On a Mac/Linux box the tool detects this and tells you to run them from Windows.
+- **Eight services.** Exchange Online, Security & Compliance (Purview), Entra / Identity
+  (Graph), Intune / Devices (Graph), Microsoft Teams, SharePoint Online (PnP), SharePoint
+  Admin (SPO) and Power Platform (admin). A module loads only when you pick its service.
+- **Ready-made actions.** Check, give and remove mailbox and calendar access, Send As,
+  distribution groups, shared mailboxes, a forwarding check, a leaver check, and user and
+  group lookups in Entra. Full list: [docs/usage.md](docs/usage.md).
+- **Run any command by name.** Every category menu has an advanced option that guides any
+  cmdlet of the connected service in the same way.
+- **Bulk from a CSV file.** Run one action for every row. Every row is checked before
+  anything runs, and each row's outcome is saved to a results CSV.
+- **Results you can use.** Show a lookup as a table, pick columns, or export to CSV.
+- **Undo for the last change.** Offered when a safe revert can be built. You decide.
+- **Help at every prompt.** Type `?` for allowed values or an explanation, and `find` to
+  search the directory instead of typing an address.
+- **Extend it with one row.** A new action is one entry in `$Actions`. See
+  [Add a new action](#add-a-new-action-the-common-case) and
+  [docs/how-it-works.md](docs/how-it-works.md).
 
-## Run it
+## Requirements
 
-In PowerShell (pwsh 7 on Windows/macOS/Linux, or Windows PowerShell 5.1) with the relevant modules:
+- PowerShell 7+ on Windows, macOS or Linux, or Windows PowerShell 5.1.
+- Microsoft's PowerShell module for the service you pick. If it is missing, the tool offers
+  to install it for the current user from the PowerShell Gallery.
+- An admin account with a Microsoft 365 role that allows the task. The tool signs in as you.
+- SharePoint Admin (SPO) and Power Platform need Windows, because Microsoft ships those
+  modules for Windows only. SharePoint Online (PnP) needs PowerShell 7.2+.
 
-```powershell
-cd M365Toolkit
-# Preview mode: never runs a change. It still signs in, reads the tenant for lookups,
-# and can install a missing module, so it is not offline.
-.\Invoke-M365Toolkit.ps1 -DryRunOnly
-# Normal run (asks y/n before running each command)
-.\Invoke-M365Toolkit.ps1
-# Only if the browser sign-in for Entra / Intune hangs (seen on macOS): device code instead
-.\Invoke-M365Toolkit.ps1 -UseDeviceCode
-# Also keep a full screen transcript of the session (off by default: it holds every result you view)
-.\Invoke-M365Toolkit.ps1 -Transcript
-```
+The full matrix is in [docs/platform-support.md](docs/platform-support.md).
 
-After each sign-in the tool shows the account the session is really signed in as, and
-stops if it differs from the email you typed. On Quit it signs out of every service it
-connected to.
-
-### Run it remotely
-
-> **⚠️ Security note.** `irm … | iex` downloads and runs a script directly in your
-> admin session — the same trust model as `curl … | bash`. **Read the script first**,
-> and pin the URL to a **specific release tag** (not the moving `main` branch) so you
-> always run a known, reviewed version. Cloning the repo and running the local file is
-> the safer default for an admin tool; use the one-liner only when you understand it.
-
-Pinned to a release tag (recommended — replace `v0.24` with the tag you reviewed):
+## Quick start
 
 ```powershell
-irm https://raw.githubusercontent.com/oracola91/m365-toolkit/v0.24/Invoke-M365Toolkit.ps1 | iex
+git clone https://github.com/oracola91/m365-toolkit.git
+cd m365-toolkit
+
+# Look around first. Preview mode never runs a change.
+./Invoke-M365Toolkit.ps1 -DryRunOnly
+
+# Normal run. Asks before running each command.
+./Invoke-M365Toolkit.ps1
 ```
 
-For the safe dry-run preview mode over the network:
+Preview mode is not offline: it still signs in, reads the tenant for lookups and can offer
+to install a missing module. The other switches (`-UseDeviceCode`, `-Transcript`) and the
+pinned one-line remote run are in [docs/running.md](docs/running.md).
+
+## Example: give a colleague access to a shared mailbox
+
+1. Start `./Invoke-M365Toolkit.ps1 -DryRunOnly` and type your admin email.
+2. Pick **Exchange Online**. After sign-in the tool shows the account and tenant it really
+   got, and warns you if that differs from the email you typed.
+3. Pick **Give access**, then **Give a user access to another mailbox (incl. shared
+   mailboxes)**, then **Run once**.
+4. Answer the prompts: the mailbox (`support@contoso.com`), the person who gets access
+   (`jordan@contoso.com`), and `FullAccess` from the numbered list. Optionally set
+   `AutoMapping` to `no`.
+5. The tool shows the exact command:
+
+   ```powershell
+   Add-MailboxPermission -Identity 'support@contoso.com' -User 'jordan@contoso.com' -AccessRights 'FullAccess' -AutoMapping $false
+   ```
+
+6. In preview mode it stops here. In a normal run it asks `Execute it now? (y/n)`. For a
+   removal it asks you to type the command name instead, and anything else cancels.
+
+## Safety: what it never does on its own
+
+- **It never runs a change you have not seen.** Every command is shown first and needs your
+  confirmation. Removals and other destructive verbs, Invoke- actions such as a device wipe,
+  mail forwarding, admin-role and mail-flow changes, and purge or force switches need the
+  command name typed. A plain `y` does not pass.
+- **It never goes past your own role.** Interactive, delegated sign-in only, with your own
+  Microsoft 365 rights. There is no app-only or certificate sign-in.
+- **It never runs local system commands.** "Run any command" lists only the connected
+  service's own cmdlets, without sign-in or raw request cmdlets.
+- **It never installs a module silently.** Installs come from the PowerShell Gallery only,
+  after showing the name, version and author and asking you.
+- **It never stays signed in.** On Quit it signs out of every service it connected to.
+- **It never undoes on its own.** The undo for the last change is an option you pick.
+- **It has no telemetry.** The script calls no web service of its own. Network traffic comes
+  from the Microsoft modules you connect with.
+- **It keeps a short action log, not a transcript.** Who, which service, the command, its
+  target and the outcome, stored owner-only and deleted after 30 days. A full screen
+  transcript is written only with `-Transcript`.
+
+Details are in [docs/running.md](docs/running.md).
+
+## Testing
+
+The engine's logic is covered by Pester tests in [`tests/`](tests/) that run without a tenant (stub
+cmdlets, scripted answers). Run them with:
 
 ```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/oracola91/m365-toolkit/v0.24/Invoke-M365Toolkit.ps1))) -DryRunOnly
+Invoke-Pester ./tests
 ```
 
-Run this way there is no local file, so logs and CSV exports go to `%USERPROFILE%\M365Toolkit\`
-on Windows or `~/M365Toolkit` on macOS and Linux. Using a tag (not `main`) also avoids the
-CDN-cache lag on fresh pushes.
+GitHub Actions runs PSScriptAnalyzer and the tests on PowerShell 7 (Linux and Windows) and
+Windows PowerShell 5.1 for every push and pull request. [`TEST-PLAN.md`](TEST-PLAN.md) lists the manual
+checks that need a real tenant.
 
-If a required module isn't installed, the tool offers to install it for the current user.
+## Status, changelog and security
 
-- Uses **your signed-in admin's RBAC role** — a helpdesk member can only do what their
-  role permits.
-- Every action (sign-in and sign-out, each command, each bulk row, each undo) is recorded in
-  `logs\actions-<timestamp>.jsonl`: who, which service and tenant, the command, its target and
-  the outcome. Other values are not kept: the Microsoft 365 unified audit log is the full record
-  of changes, and this local file is not an audit trail. A full screen transcript
-  (`logs\session-<timestamp>.log`) is written only with `-Transcript`. Logs and the tool's own
-  exports are owner-only and deleted after 30 days.
-- At any parameter prompt, type **`?`** to list the allowed values. In the category and
-  action menus, type **`?`** for a short explanation of each choice.
+See [CHANGELOG.md](CHANGELOG.md) for what changed in each version, and
+[SECURITY.md](SECURITY.md) to report a security problem.
 
-## What you can do
+Known limits, on purpose:
 
-Catalogued actions cover the common jobs, grouped by category:
+- Interactive, delegated sign-in only: no app-only or certificate auth for unattended runs.
+  Adding it would need a service-account review first.
+- Legacy AzureAD and MSOnline are retired and not supported; use the Graph services.
+- An optional plain-English layer through an external AI service was considered. It would
+  send directory data to a new party and turn model output into admin commands, so it needs
+  a security review and IT approval before anyone builds it.
 
-- **Exchange Online.** Check access (who has access to a mailbox or calendar, who can Send As,
-  which mail groups or shared mailboxes a user has, who is in a distribution group, where a
-  mailbox forwards mail, and a leaver check of everything a user can still access); Give access
-  (mailbox, Send As, calendar, distribution group); Remove and change access (mailbox and
-  calendar); Mailboxes (look up, change a setting, create or convert shared mailboxes).
-- **Entra / Identity (Graph).** Look up a user; see which groups a user is directly in, or all
-  groups including nested ones.
-- **SharePoint Admin (SPO).** List all sites. **Intune / Devices (Graph).** List enrolled
-  devices. **Power Platform (admin).** List environments.
+## Contributing
 
-**Beyond the catalogue — full capability:** every category menu has a
-**"Run any command by name (advanced)"** option. Type any cmdlet in the connected module
-and the engine guides its parameters exactly the same way. So the tool is not limited to
-the catalogued actions — it can drive *any* cmdlet the connected module exposes.
+Issues and pull requests are welcome. Please report a security problem privately, as
+[SECURITY.md](SECURITY.md) describes, not in a public issue.
 
-**Run once or in bulk:** after choosing an action that changes something (or a run-any
-cmdlet) you pick **Run once** (type the values now) or **Bulk from a CSV file** (run it for every row;
-UTF-8 or Excel's ANSI encoding, `,` or `;` separated).
+Before you open a pull request, run the same checks as CI:
 
-**Results / export:** when a command returns objects (e.g. a lookup), the tool offers to
-show them as a table, show only columns you choose, or **export to CSV** (all columns or a
-chosen subset). CSVs default to the tool's `exports` folder (next to the script). They are
-owner-only, formula cells are written as text, and the tool deletes its own exports after 30
-days; a path you type elsewhere is not cleaned up.
+```powershell
+Invoke-Pester ./tests
+Invoke-ScriptAnalyzer -Path ./Invoke-M365Toolkit.ps1 -ExcludeRule PSAvoidUsingWriteHost
+```
 
-**Convenience:** the tool remembers your email (UPN) and last-used service between runs
-(stored in `config.json`, never committed); after connecting it shows **who you're signed
-in as** (and your Graph scopes / Exchange org); every category menu has **Search actions by
-keyword**; and for identity fields you can type **`find`** to search the directory and pick a
-person or mailbox from a list instead of typing the address.
+The most common change is a new action, which is one row:
 
-## Add a new action (the common case)
+### Add a new action (the common case)
 
 Append one entry to `$Actions` in `Invoke-M365Toolkit.ps1`:
 
@@ -171,29 +206,14 @@ If a parameter has fixed values but the cmdlet hides them (common with Exchange 
 proxy cmdlets that expose things as `Object[]`), teach the tool by adding a row to
 `$ParamHints` (keyed by parameter name), e.g. `AccessRights = @('FullAccess','SendAs',...)`.
 
-## Tests
+## Documentation
 
-The engine's logic is covered by Pester tests in `tests/` that run without a tenant (stub
-cmdlets, scripted answers). Run them with:
-
-```powershell
-Invoke-Pester ./tests
-```
-
-GitHub Actions runs PSScriptAnalyzer and the tests on PowerShell 7 (Linux and Windows) and
-Windows PowerShell 5.1 for every push and pull request. `TEST-PLAN.md` lists the manual
-checks that need a real tenant.
-
-## Status
-
-See [CHANGELOG.md](CHANGELOG.md) for what changed in each version, and
-[SECURITY.md](SECURITY.md) to report a security problem.
-
-Known limits, on purpose:
-
-- Interactive, delegated sign-in only: no app-only or certificate auth for unattended runs.
-  Adding it would need a service-account review first.
-- Legacy AzureAD and MSOnline are retired and not supported; use the Graph services.
-- An optional plain-English layer through an external AI service was considered. It would
-  send directory data to a new party and turn model output into admin commands, so it needs
-  a security review and IT approval before anyone builds it.
+| Page | What is in it |
+|---|---|
+| [docs/how-it-works.md](docs/how-it-works.md) | The four layers: services, the introspection engine, the action catalogue, the bulk runner |
+| [docs/usage.md](docs/usage.md) | Every catalogued action, run once or in bulk, results and export, conveniences |
+| [docs/running.md](docs/running.md) | All switches, the pinned remote run, modules, permissions and logs |
+| [docs/platform-support.md](docs/platform-support.md) | Which service works on which platform and PowerShell version |
+| [TEST-PLAN.md](TEST-PLAN.md) | Manual checks that need a real tenant |
+| [CHANGELOG.md](CHANGELOG.md) | What changed in each version |
+| [SECURITY.md](SECURITY.md) | How to report a vulnerability, and what is in scope |
