@@ -23,6 +23,28 @@ jobs:
           $r = Invoke-ScriptAnalyzer -Path ./Invoke-M365Toolkit.ps1 -ExcludeRule PSAvoidUsingWriteHost
           $r | Sort-Object Severity, Line | Format-Table -AutoSize Severity, Line, RuleName, Message | Out-String -Width 220 | Write-Host
           if (@($r | Where-Object Severity -eq 'Error').Count -gt 0) { throw 'PSScriptAnalyzer found errors.' }
+      - name: PowerShell Gallery metadata
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # The same check Publish-Script runs before an upload (PowerShellGet).
+          $info = Test-ScriptFileInfo -Path ./Invoke-M365Toolkit.ps1
+          $info | Format-List Name, Version, Guid, Author, Tags, ProjectUri, LicenseUri | Out-String -Width 220 | Write-Host
+          # PSResourceGet (Install-PSResource) reads the same block with its own parser.
+          if (Get-Command Test-PSScriptFileInfo -ErrorAction SilentlyContinue) {
+            if (-not (Test-PSScriptFileInfo -Path ./Invoke-M365Toolkit.ps1)) { throw 'Test-PSScriptFileInfo failed.' }
+          }
+          # The help text must still be found after the PSScriptInfo block.
+          $help = Get-Help ./Invoke-M365Toolkit.ps1
+          if (-not $help.Synopsis -or -not $help.Description) { throw 'Comment-based help not found.' }
+          # The Gallery version must match the version the tool prints in its banner.
+          $m = Select-String -Path ./Invoke-M365Toolkit.ps1 -Pattern '^\$script:ToolkitVersion = ''v([0-9.]+)''' | Select-Object -First 1
+          if (-not $m) { throw 'ToolkitVersion line not found.' }
+          $norm = { param([version]$v) '{0}.{1}.{2}' -f $v.Major, $v.Minor, [math]::Max($v.Build, 0) }
+          $tool = & $norm $m.Matches[0].Groups[1].Value
+          $gallery = & $norm $info.Version
+          if ($tool -ne $gallery) { throw "Version mismatch: PSScriptInfo $gallery, ToolkitVersion $tool." }
+          Write-Host "Gallery version $gallery matches ToolkitVersion."
 
   test:
     strategy:

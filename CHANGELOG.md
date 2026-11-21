@@ -2,6 +2,11 @@
 
 All notable changes to the M365 Guided Command Builder. Newest first.
 
+## Unreleased
+- PowerShell Gallery packaging: a PSScriptInfo block at the top of the script, a CI check of
+  that block and of the version, and the publishing steps in `docs/PUBLISHING.md`.
+  The tool itself is unchanged.
+
 ## v0.32 (2026-10-25)
 - "Run any command" search matches the typed text literally; a `[` no longer ends the tool.
 - A single run skips the cmdlet's own "Are you sure?" after the tool's confirmation (as bulk

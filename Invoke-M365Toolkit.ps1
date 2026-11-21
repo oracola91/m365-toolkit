@@ -1,3 +1,36 @@
+<#PSScriptInfo
+
+.VERSION 0.32.0
+
+.GUID db3da549-683a-403b-a09d-26ad992b7b55
+
+.AUTHOR oracola91
+
+.COMPANYNAME
+
+.COPYRIGHT Copyright (c) 2026 oracola91. MIT License.
+
+.TAGS microsoft-365 office365 exchange-online entra-id intune microsoft-graph sharepoint-online helpdesk sysadmin powershell PSEdition_Core PSEdition_Desktop Windows Linux MacOS
+
+.LICENSEURI https://github.com/oracola91/m365-toolkit/blob/main/LICENSE
+
+.PROJECTURI https://github.com/oracola91/m365-toolkit
+
+.ICONURI
+
+.EXTERNALMODULEDEPENDENCIES
+
+.REQUIREDSCRIPTS
+
+.EXTERNALSCRIPTDEPENDENCIES
+
+.RELEASENOTES
+See CHANGELOG.md: https://github.com/oracola91/m365-toolkit/blob/main/CHANGELOG.md
+
+.PRIVATEDATA
+
+#>
+
 <#
 .SYNOPSIS
     Guided, plain-language command builder for Microsoft 365 PowerShell.
