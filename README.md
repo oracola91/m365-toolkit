@@ -12,6 +12,7 @@
 
 <p align="center">
   <a href="https://github.com/oracola91/m365-toolkit/actions/workflows/ci.yml"><img alt="CI status" src="https://img.shields.io/github/actions/workflow/status/oracola91/m365-toolkit/ci.yml?branch=main&label=CI"></a>
+  <a href="LICENSE"><img alt="Licence: MIT" src="https://img.shields.io/github/license/oracola91/m365-toolkit?label=licence"></a>
   <img alt="PowerShell 5.1 and 7+" src="https://img.shields.io/badge/PowerShell-5.1%20%7C%207%2B-5391FE?logo=powershell&logoColor=white">
   <img alt="Runs on Windows, macOS and Linux" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-informational">
   <a href="tests/"><img alt="Tests: Pester 5" src="https://img.shields.io/badge/tests-Pester%205-brightgreen"></a>
@@ -217,3 +218,7 @@ proxy cmdlets that expose things as `Object[]`), teach the tool by adding a row 
 | [TEST-PLAN.md](TEST-PLAN.md) | Manual checks that need a real tenant |
 | [CHANGELOG.md](CHANGELOG.md) | What changed in each version |
 | [SECURITY.md](SECURITY.md) | How to report a vulnerability, and what is in scope |
+
+## Licence
+
+Released under the [MIT licence](LICENSE).
