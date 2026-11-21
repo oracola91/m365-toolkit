@@ -97,6 +97,16 @@ cd m365-toolkit
 ./Invoke-M365Toolkit.ps1
 ```
 
+From the PowerShell Gallery (after the first Gallery publish, not available yet):
+
+```powershell
+Install-Script -Name Invoke-M365Toolkit -Scope CurrentUser
+Invoke-M365Toolkit.ps1 -DryRunOnly
+```
+
+The first install asks to add your Scripts folder to PATH. An installed copy writes its logs
+and CSV exports next to the script, in that Scripts folder.
+
 Preview mode is not offline: it still signs in, reads the tenant for lookups and can offer
 to install a missing module. The other switches (`-UseDeviceCode`, `-Transcript`) and the
 pinned one-line remote run are in [docs/running.md](docs/running.md).
